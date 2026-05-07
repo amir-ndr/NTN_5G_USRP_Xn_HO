@@ -1,0 +1,10 @@
+Probing:
+/opt/homebrew/bin/uhd_usrp_probe --args "addr=192.168.10.4"
+/opt/homebrew/bin/uhd_usrp_probe --args "addr=192.168.20.6"
+/opt/local/bin/uhd_find_devices
+----------------------------------------------------------------
+Laod FPGA Image:
+/opt/homebrew/bin/uhd_image_loader --args="type=x300,addr=192.168.10.4,fpga=HG"
+----------------------------------------------------------------
+running:
+/opt/homebrew/bin/python3 /Users/amir/Desktop/Queens/Network/DND/MASS/tx.py
