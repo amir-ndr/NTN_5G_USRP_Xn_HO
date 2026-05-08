@@ -8,3 +8,4 @@ Laod FPGA Image:
 ----------------------------------------------------------------
 running:
 /opt/homebrew/bin/python3 /Users/amir/Desktop/Queens/Network/DND/MASS/tx.py
+sudo ifconfig en9 alias 192.168.10.1 netmask 255.255.255.0

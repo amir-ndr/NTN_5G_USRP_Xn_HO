@@ -38,7 +38,6 @@ import argparse
 import json
 import math
 import os
-import random
 import signal
 import time
 from collections import defaultdict
@@ -47,6 +46,7 @@ from pathlib import Path
 
 from skyfield.api import load, wgs84
 from orbit import OrbitalEngine
+from dispatcher import Dispatcher
 
 _HERE = Path(__file__).resolve().parent
 
@@ -254,24 +254,36 @@ def find_pass(tle_file: str, lat: float, lon: float, alt_m: float,
 
 # ── Handover trigger ──────────────────────────────────────────────────────────
 
-def _trigger_handover(state, engine: OrbitalEngine, sim_time: float, min_el: float) -> bool:
+def _trigger_handover(
+    state,
+    engine:     OrbitalEngine,
+    sim_time:   float,
+    min_el:     float,
+    dispatcher: Dispatcher,
+) -> bool:
     """
     Execute an Xn handover:
-      1. Write dest_override.txt (routing decision)
-      2. Promote tgtSat → new srcSat
-      3. Scan full constellation for next tgtSat (highest elevation, not current src)
-      4. Update engine pair
+      1. Dispatcher selects ISL or Ground path (learned routing)
+      2. Write dest_override.txt
+      3. Promote tgtSat → new srcSat
+      4. Scan full constellation for next tgtSat (highest elevation)
+      5. Update engine pair
 
-    Returns True if the new tgt satellite was successfully found, False if the
-    constellation scan found no visible candidate (pair remains src=promoted, tgt=None
-    temporarily — the main loop will retry next iteration).
+    Returns True if the new tgt satellite was found, False otherwise.
     """
-    new_dest = random.choice(["trgSAT", "TN"])   # ← replace with your routing algorithm
+    # ── Dispatcher decides the path ───────────────────────────────────────────
+    path, info = dispatcher.dispatch(
+        isl_ms  = state.isl_delay_ms,
+        gnd_ms  = state.sat_gnd_delay_ms,
+        src_sat = state.src_name,
+        tgt_sat = state.tgt_name,
+    )
+    new_dest = "trgSAT" if path == "ISL" else "TN"
 
     try:
         with open(DEST_OVERRIDE, "w") as f:
             f.write(new_dest)
-        dest_status = f"'{DEST_OVERRIDE}' → '{new_dest}'"
+        dest_status = f"'{DEST_OVERRIDE}' → '{new_dest}'  [{path} path]"
     except OSError as e:
         dest_status = f"WARNING: could not write {DEST_OVERRIDE}: {e}"
 
@@ -284,8 +296,13 @@ def _trigger_handover(state, engine: OrbitalEngine, sim_time: float, min_el: flo
     print(f"  UE→srcSat ({state.src_name}) elevation = {state.ue_src_elevation_deg:.1f}°  "
           f"(below threshold {min_el}°)")
     print(f"  UE→tgtSat ({state.tgt_name}) elevation = {state.ue_tgt_elevation_deg:.1f}°")
-    print(f"  ISL delay  = {state.isl_delay_ms:.2f} ms  |  "
-          f"Sat-gnd delay = {state.sat_gnd_delay_ms:.2f} ms")
+    print(f"  Prop delay : ISL={state.isl_delay_ms:.2f} ms  |  GND={state.sat_gnd_delay_ms:.2f} ms")
+    print(f"  Dispatcher : {path} path selected  "
+          f"(P(ISL)={info['p_isl']:.3f}  P(GND)={info['p_gnd']:.3f})")
+    print(f"  Core delay : AMF={info['amf_ms']:.1f} ms  SMF={info['smf_ms']:.1f} ms  "
+          f"UPF={info['upf_ms']:.1f} ms  →  total={info['total_ms']:.1f} ms")
+    print(f"  Regret     : {info['regret_ms']:.1f} ms  (oracle={info['oracle_ms']:.1f} ms  "
+          f"cum={info['cum_regret_ms']:.0f} ms)")
     print(f"  Routing    : {dest_status}")
     print(f"  Promoting  : {state.tgt_name} → new srcSat  |  "
           f"{state.src_name} → retired")
@@ -389,11 +406,14 @@ def main():
         engine.update_pair(src, tgt)
         print(f"[Controller] Scan complete in {elapsed:.1f}s")
 
+    dispatcher = Dispatcher(log_dir=_HERE)
+
     running = True
     def _stop(*_):
         nonlocal running
         running = False
         print("\n[Controller] Stopping.")
+        dispatcher.close()
     signal.signal(signal.SIGINT, _stop)
 
     sim_label = (f"  time scale: {scale:.1f}×  (~HO every {5400/scale:.0f}s real)"
@@ -442,7 +462,7 @@ def main():
             if reset_interval_s:
                 ho_reset_at = now_real + reset_interval_s
 
-            _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG)
+            _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG, dispatcher)
 
             # Recompute state with the new pair for accurate display
             state = engine.state(unix_time=sim_time)
