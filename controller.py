@@ -7,6 +7,7 @@ Runs a continuous loop that:
   2. Computes ISL and sat-to-ground one-way propagation delays
   3. Writes delays to delays.json — trgSAT.py and TN.py sleep by these
      amounts after receiving a packet, emulating orbital propagation latency
+     (or pushes them to NE-ONE via REST if --delay=NE-ONE is set)
   4. Triggers Xn handover when srcSat elevation drops below threshold;
      at that point it PROMOTES tgtSat → new srcSat, then scans the full
      constellation to pick the next best visible satellite as the new tgtSat
@@ -25,9 +26,15 @@ Fixed mode (SRC_SAT_NAME / TGT_SAT_NAME non-empty):
   Works like the original controller, but still promotes and auto-scans at each
   subsequent HO rather than cycling back to the same fixed pair.
 
+Delay modes (--delay):
+    normal  : write delays.json; trgSAT/TN apply via time.sleep()  [default]
+    NE-ONE  : write delays.json AND push to NE-ONE via REST API each loop tick;
+              trgSAT/TN must also be started with --delay=NE-ONE to skip sleep
+
 Usage:
-    python3 controller.py                   # dynamic auto-select
-    python3 controller.py --ho-every 30    # HO every 30 real seconds
+    python3 controller.py                        # dynamic auto-select, normal delays
+    python3 controller.py --ho-every 30          # HO every 30 real seconds
+    python3 controller.py --delay NE-ONE         # NE-ONE emulator mode
     python3 controller.py --list-sats
     python3 controller.py --find-pass
 """
@@ -88,6 +95,17 @@ SIM_TIME_SCALE = 1.0
 
 DELAYS_FILE   = str(_HERE / "delays.json")
 DEST_OVERRIDE = str(_HERE / "dest_override.txt")
+
+# ── NE-ONE config — only used when running with --delay=NE-ONE ────────────────
+# Set NE_ONE_HOST to the IP of your NE-ONE unit.
+# NE_ONE_ISL_LINK / NE_ONE_GND_LINK are the link IDs shown in the NE-ONE GUI
+# (Topology page → click a link → note the ID in the URL or properties panel).
+NE_ONE_HOST     = "192.168.1.100"   # ← change to your NE-ONE IP
+NE_ONE_ISL_LINK = "1"              # ← link ID for ISL  pipe in NE-ONE
+NE_ONE_GND_LINK = "2"              # ← link ID for GND pipe in NE-ONE
+NE_ONE_USER     = ""               # HTTP Basic auth username (leave "" if none)
+NE_ONE_PASS     = ""               # HTTP Basic auth password (leave "" if none)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -348,6 +366,9 @@ def main():
                    help="Simulated time acceleration factor")
     p.add_argument("--ho-every",     type=float, default=None, metavar="SECONDS",
                    help="Auto-set time scale to trigger HO approximately every N real seconds")
+    p.add_argument("--delay",        choices=["normal", "NE-ONE"], default="normal",
+                   help="Delay mode: 'normal'=delays.json+receiver sleep (default), "
+                        "'NE-ONE'=also push delays to NE-ONE emulator via REST API")
     args = p.parse_args()
 
     if args.list_sats:
@@ -408,6 +429,24 @@ def main():
 
     dispatcher = Dispatcher(log_dir=_HERE)
 
+    # ── NE-ONE setup ──────────────────────────────────────────────────────────
+    neone = None
+    if args.delay == "NE-ONE":
+        from neone_ctrl import NeoNEController
+        neone = NeoNEController(
+            host        = NE_ONE_HOST,
+            isl_link_id = NE_ONE_ISL_LINK,
+            gnd_link_id = NE_ONE_GND_LINK,
+            username    = NE_ONE_USER,
+            password    = NE_ONE_PASS,
+        )
+        print(f"[Controller] Delay mode : NE-ONE  "
+              f"(delays pushed to {NE_ONE_HOST} each loop tick)")
+        print(f"[Controller] trgSAT.py and TN.py must also be started with --delay=NE-ONE")
+    else:
+        print(f"[Controller] Delay mode : normal  "
+              f"(delays.json written; receivers apply via sleep)")
+
     running = True
     def _stop(*_):
         nonlocal running
@@ -445,6 +484,8 @@ def main():
             state.isl_delay_ms, state.sat_gnd_delay_ms,
             state.src_name, state.tgt_name, state.ue_tgt_elevation_deg,
         )
+        if neone is not None:
+            neone.set_both(state.isl_delay_ms, state.sat_gnd_delay_ms)
 
         src_el  = state.ue_src_elevation_deg
         ho_flag = ""
