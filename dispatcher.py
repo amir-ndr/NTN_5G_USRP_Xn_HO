@@ -307,6 +307,45 @@ class CorePath:
             "core_ms": core_ms, "core_cost": core_cost,
         }
 
+    def route_random(self) -> dict:
+        """
+        Route one HO with uniform random instance selection — no weight updates,
+        no queue/B state changes. Used by RandomDispatcher baseline.
+        """
+        A_amf = float(np.random.uniform(A_LO, A_HI))
+        A_smf = float(np.random.uniform(A_LO, A_HI))
+        A_upf = float(np.random.uniform(A_LO, A_HI))
+
+        amf_idx = int(np.random.randint(self.amf.n))
+        smf_idx = int(np.random.randint(self.smf.n))
+        upf_idx = int(np.random.randint(self.upf.n))
+
+        amf_ms   = self.amf.instances[amf_idx].sojourn(A_amf)
+        smf_ms   = self.smf.instances[smf_idx].sojourn(A_smf)
+        upf_ms   = self.upf.instances[upf_idx].sojourn(A_upf)
+
+        amf_x    = self.amf.instances[amf_idx].x_signal(amf_ms)
+        smf_x    = self.smf.instances[smf_idx].x_signal(smf_ms)
+        upf_x    = self.upf.instances[upf_idx].x_signal(upf_ms)
+
+        amf_cost = self.amf.instances[amf_idx].cost(amf_x)
+        smf_cost = self.smf.instances[smf_idx].cost(smf_x)
+        upf_cost = self.upf.instances[upf_idx].cost(upf_x)
+
+        core_ms   = amf_ms + smf_ms + upf_ms
+        core_cost = amf_cost + smf_cost + upf_cost
+
+        p_u = [round(1/3, 4)] * 3
+        return {
+            "amf_inst": amf_idx, "amf_p": p_u, "amf_ms": amf_ms,
+            "amf_x": amf_x, "amf_cost": amf_cost,
+            "smf_inst": smf_idx, "smf_p": p_u, "smf_ms": smf_ms,
+            "smf_x": smf_x, "smf_cost": smf_cost,
+            "upf_inst": upf_idx, "upf_p": p_u, "upf_ms": upf_ms,
+            "upf_x": upf_x, "upf_cost": upf_cost,
+            "core_ms": core_ms, "core_cost": core_cost,
+        }
+
 
 class Dispatcher:
     """
@@ -475,6 +514,112 @@ class Dispatcher:
         for fh in self._files:
             fh.close()
         print(f"[Dispatcher] Closed.  Total HOs={self.ho_id}  "
+              f"Cumulative regret={self.cum_regret:.1f} ms")
+
+
+class RandomDispatcher:
+    """
+    Baseline dispatcher — uniform random path and instance selection.
+
+    No weight updates, no B/Q state changes, no learning.
+    Used as a comparison baseline against the Bregman algorithm.
+
+    Path selection : uniform random  (p_isl = p_gnd = 0.5 always)
+    Core routing   : uniform random instance per layer (p_i = 1/3 each)
+
+    Writes to random_log.csv with the same column layout as dispatch_log.csv
+    so the plotter can overlay both without special-casing.
+    """
+
+    def __init__(self, log_dir: str | Path = "."):
+        self.onboard = CorePath(_ON_AMF, _ON_SMF, _ON_UPF)
+        self.ground  = CorePath(_GND_AMF, _GND_SMF, _GND_UPF)
+
+        self.ho_id      = 0
+        self.cum_regret = 0.0
+
+        log_dir  = Path(log_dir)
+        self._fh = open(log_dir / "random_log.csv", "w", newline="")
+        self._wr = csv.DictWriter(self._fh, fieldnames=_CSV_HEADER)
+        self._wr.writeheader()
+
+        print(f"[RandomDispatcher] Uniform random baseline  →  {log_dir}/random_log.csv")
+
+    def dispatch(
+        self,
+        isl_ms:  float,
+        gnd_ms:  float,
+        src_sat: str = "",
+        tgt_sat: str = "",
+    ) -> tuple[str, dict]:
+        """Select path and instances uniformly at random. No weight updates."""
+        self.ho_id += 1
+
+        path_idx = int(np.random.randint(2))
+        path     = "ISL" if path_idx == 0 else "GND"
+        prop_ms  = isl_ms if path_idx == 0 else gnd_ms
+        core     = self.onboard if path_idx == 0 else self.ground
+
+        r        = core.route_random()
+        total_ms = prop_ms + r["core_ms"]
+
+        oracle_ms       = min(isl_ms + _oracle_core_ms(self.onboard),
+                              gnd_ms + _oracle_core_ms(self.ground))
+        regret_ms       = max(total_ms - oracle_ms, 0.0)
+        self.cum_regret += regret_ms
+
+        p_u = [round(1 / 3, 4)] * 3
+
+        row = {
+            "ho_id":      self.ho_id,
+            "timestamp":  datetime.now(tz=timezone.utc).isoformat(),
+            "path":       path,
+            "isl_ms":     round(isl_ms,  3),
+            "gnd_ms":     round(gnd_ms,  3),
+            "prop_ms":    round(prop_ms, 3),
+            "amf_inst":   r["amf_inst"],
+            "amf_p0": p_u[0], "amf_p1": p_u[1], "amf_p2": p_u[2],
+            "amf_ms":     round(r["amf_ms"],   3),
+            "amf_x":      round(r["amf_x"],    5),
+            "amf_cost":   round(r["amf_cost"], 5),
+            "smf_inst":   r["smf_inst"],
+            "smf_p0": p_u[0], "smf_p1": p_u[1], "smf_p2": p_u[2],
+            "smf_ms":     round(r["smf_ms"],   3),
+            "smf_x":      round(r["smf_x"],    5),
+            "smf_cost":   round(r["smf_cost"], 5),
+            "upf_inst":   r["upf_inst"],
+            "upf_p0": p_u[0], "upf_p1": p_u[1], "upf_p2": p_u[2],
+            "upf_ms":     round(r["upf_ms"],   3),
+            "upf_x":      round(r["upf_x"],    5),
+            "upf_cost":   round(r["upf_cost"], 5),
+            "core_ms":    round(r["core_ms"],  3),
+            "core_cost":  round(r["core_cost"],5),
+            "on_amf_p0":  p_u[0], "on_amf_p1":  p_u[1], "on_amf_p2":  p_u[2],
+            "on_smf_p0":  p_u[0], "on_smf_p1":  p_u[1], "on_smf_p2":  p_u[2],
+            "on_upf_p0":  p_u[0], "on_upf_p1":  p_u[1], "on_upf_p2":  p_u[2],
+            "gnd_amf_p0": p_u[0], "gnd_amf_p1": p_u[1], "gnd_amf_p2": p_u[2],
+            "gnd_smf_p0": p_u[0], "gnd_smf_p1": p_u[1], "gnd_smf_p2": p_u[2],
+            "gnd_upf_p0": p_u[0], "gnd_upf_p1": p_u[1], "gnd_upf_p2": p_u[2],
+            "p_isl":         0.5000,
+            "p_gnd":         0.5000,
+            "total_ms":      round(total_ms,       3),
+            "total_cost":    0.0,
+            "oracle_ms":     round(oracle_ms,      3),
+            "regret_ms":     round(regret_ms,      3),
+            "cum_regret_ms": round(self.cum_regret, 3),
+        }
+
+        self._wr.writerow(row)
+        self._fh.flush()
+        return path, row
+
+    def status(self) -> str:
+        return (f"[RandomDispatcher] P(ISL)=0.500  P(GND)=0.500  "
+                f"cum_regret={self.cum_regret:.1f} ms  ho_id={self.ho_id}")
+
+    def close(self) -> None:
+        self._fh.close()
+        print(f"[RandomDispatcher] Closed.  Total HOs={self.ho_id}  "
               f"Cumulative regret={self.cum_regret:.1f} ms")
 
 

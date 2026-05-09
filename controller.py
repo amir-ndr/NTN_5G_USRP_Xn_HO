@@ -53,7 +53,7 @@ from pathlib import Path
 
 from skyfield.api import load, wgs84
 from orbit import OrbitalEngine
-from dispatcher import Dispatcher
+from dispatcher import Dispatcher, RandomDispatcher
 
 _HERE = Path(__file__).resolve().parent
 
@@ -274,10 +274,11 @@ def find_pass(tle_file: str, lat: float, lon: float, alt_m: float,
 
 def _trigger_handover(
     state,
-    engine:     OrbitalEngine,
-    sim_time:   float,
-    min_el:     float,
-    dispatcher: Dispatcher,
+    engine:          OrbitalEngine,
+    sim_time:        float,
+    min_el:          float,
+    dispatcher:      Dispatcher,
+    rand_dispatcher: "RandomDispatcher | None" = None,
 ) -> bool:
     """
     Execute an Xn handover:
@@ -296,6 +297,13 @@ def _trigger_handover(
         src_sat = state.src_name,
         tgt_sat = state.tgt_name,
     )
+    if rand_dispatcher is not None:
+        rand_dispatcher.dispatch(
+            isl_ms  = state.isl_delay_ms,
+            gnd_ms  = state.sat_gnd_delay_ms,
+            src_sat = state.src_name,
+            tgt_sat = state.tgt_name,
+        )
     new_dest = "trgSAT" if path == "ISL" else "TN"
 
     try:
@@ -427,7 +435,8 @@ def main():
         engine.update_pair(src, tgt)
         print(f"[Controller] Scan complete in {elapsed:.1f}s")
 
-    dispatcher = Dispatcher(log_dir=_HERE)
+    dispatcher      = Dispatcher(log_dir=_HERE)
+    rand_dispatcher = RandomDispatcher(log_dir=_HERE)
 
     # ── NE-ONE setup ──────────────────────────────────────────────────────────
     neone = None
@@ -453,6 +462,7 @@ def main():
         running = False
         print("\n[Controller] Stopping.")
         dispatcher.close()
+        rand_dispatcher.close()
     signal.signal(signal.SIGINT, _stop)
 
     sim_label = (f"  time scale: {scale:.1f}×  (~HO every {5400/scale:.0f}s real)"
@@ -503,7 +513,8 @@ def main():
             if reset_interval_s:
                 ho_reset_at = now_real + reset_interval_s
 
-            _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG, dispatcher)
+            _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG,
+                              dispatcher, rand_dispatcher)
 
             # Recompute state with the new pair for accurate display
             state = engine.state(unix_time=sim_time)
