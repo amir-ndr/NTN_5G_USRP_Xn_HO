@@ -53,7 +53,12 @@ from pathlib import Path
 
 from skyfield.api import load, wgs84
 from orbit import OrbitalEngine
-from dispatcher import Dispatcher, RandomDispatcher
+from dispatcher import (
+    Dispatcher, RandomDispatcher,
+    AccessNode, PathScheduler,
+    trgsat_bg_load, tn_bg_load,
+    TASK_CYCLE,
+)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -110,13 +115,18 @@ NE_ONE_PASS     = ""               # HTTP Basic auth password (leave "" if none)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _write_delays(isl_ms: float, gnd_ms: float, src_name: str, tgt_name: str, tgt_el: float):
+def _write_delays(
+    isl_ms: float, gnd_ms: float,
+    src_name: str, tgt_name: str, tgt_el: float,
+    task_type: str = "mixed",
+):
     payload = {
         "isl_ms":     round(isl_ms, 3),
         "gnd_ms":     round(gnd_ms, 3),
         "src_sat":    src_name,
         "tgt_sat":    tgt_name,
         "tgt_el_deg": round(tgt_el, 1),
+        "task_type":  task_type,
     }
     tmp = DELAYS_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -274,36 +284,67 @@ def find_pass(tle_file: str, lat: float, lon: float, alt_m: float,
 
 def _trigger_handover(
     state,
-    engine:          OrbitalEngine,
-    sim_time:        float,
-    min_el:          float,
-    dispatcher:      Dispatcher,
-    rand_dispatcher: "RandomDispatcher | None" = None,
+    engine:           OrbitalEngine,
+    sim_time:         float,
+    min_el:           float,
+    dispatcher:       Dispatcher,
+    trgsat_node:      AccessNode,
+    tn_node:          AccessNode,
+    task_type:        str,
+    path_schedulers:  "dict[str, PathScheduler]",
+    rand_dispatcher:  "RandomDispatcher | None" = None,
 ) -> bool:
     """
-    Execute an Xn handover:
-      1. Dispatcher selects ISL or Ground path (learned routing)
-      2. Write dest_override.txt
-      3. Promote tgtSat → new srcSat
-      4. Scan full constellation for next tgtSat (highest elevation)
-      5. Update engine pair
+    Execute an Xn handover via two-level Bregman learning:
+      1. Compute access costs for both paths
+      2. Level-1: per-task-type PathScheduler samples path (Bregman mirror descent)
+      3. Level-2: Dispatcher selects AMF/SMF/UPF instances (Bregman)
+      4. PathScheduler updated with access_cost of chosen path (paper gradient signal)
+      5. RandomDispatcher: 50/50 random path + uniform NF (baseline)
+      6. Write dest_override.txt, promote tgtSat, scan for next tgtSat
 
-    Returns True if the new tgt satellite was found, False otherwise.
+    Returns True if next tgt satellite was found, False otherwise.
     """
-    # ── Dispatcher decides the path ───────────────────────────────────────────
-    path, info = dispatcher.dispatch(
-        isl_ms  = state.isl_delay_ms,
-        gnd_ms  = state.sat_gnd_delay_ms,
-        src_sat = state.src_name,
-        tgt_sat = state.tgt_name,
+    isl_ms = state.isl_delay_ms
+    gnd_ms = state.sat_gnd_delay_ms
+
+    # ── Level-1: access costs + per-task Bregman PathScheduler ──────────────
+    cost_isl = trgsat_node.total_access_cost_ms(isl_ms)
+    cost_gnd = tn_node.total_access_cost_ms(gnd_ms)
+
+    sched = path_schedulers[task_type]
+    path  = sched.sample()
+
+    # ── Level-2: Bregman NF instance selection ────────────────────────────────
+    _, info = dispatcher.dispatch(
+        path            = path,
+        isl_ms          = isl_ms,
+        gnd_ms          = gnd_ms,
+        task_type       = task_type,
+        path_p_isl      = sched.p_isl,
+        path_p_gnd      = sched.p_gnd,
+        access_cost_isl = cost_isl,
+        access_cost_gnd = cost_gnd,
+        trgsat_bg       = trgsat_node.bg_load,
+        tn_bg           = tn_node.bg_load,
     )
+
+    # Update Level-1 scheduler with access cost of chosen path (paper gradient signal)
+    access_cost_chosen = cost_isl if path == "ISL" else cost_gnd
+    sched.update(path, access_cost_chosen)
+
+    # ── Random baseline: 50/50 path + uniform NF (independent of Bregman) ────
     if rand_dispatcher is not None:
         rand_dispatcher.dispatch(
-            isl_ms  = state.isl_delay_ms,
-            gnd_ms  = state.sat_gnd_delay_ms,
-            src_sat = state.src_name,
-            tgt_sat = state.tgt_name,
+            isl_ms          = isl_ms,
+            gnd_ms          = gnd_ms,
+            task_type       = task_type,
+            access_cost_isl = cost_isl,
+            access_cost_gnd = cost_gnd,
+            trgsat_bg       = trgsat_node.bg_load,
+            tn_bg           = tn_node.bg_load,
         )
+
     new_dest = "trgSAT" if path == "ISL" else "TN"
 
     try:
@@ -319,16 +360,22 @@ def _trigger_handover(
     print(f"\n{'='*80}")
     print(f"  [HO TRIGGER]  Xn Handover initiated  "
           f"(sim time {time.strftime('%H:%M:%S', time.gmtime(state.timestamp))})")
+    print(f"  Task type  : {task_type}")
     print(f"  UE→srcSat ({state.src_name}) elevation = {state.ue_src_elevation_deg:.1f}°  "
           f"(below threshold {min_el}°)")
     print(f"  UE→tgtSat ({state.tgt_name}) elevation = {state.ue_tgt_elevation_deg:.1f}°")
-    print(f"  Prop delay : ISL={state.isl_delay_ms:.2f} ms  |  GND={state.sat_gnd_delay_ms:.2f} ms")
-    print(f"  Dispatcher : {path} path selected  "
-          f"(P(ISL)={info['p_isl']:.3f}  P(GND)={info['p_gnd']:.3f})")
-    print(f"  Core delay : AMF={info['amf_ms']:.1f} ms  SMF={info['smf_ms']:.1f} ms  "
-          f"UPF={info['upf_ms']:.1f} ms  →  total={info['total_ms']:.1f} ms")
-    print(f"  Regret     : {info['regret_ms']:.1f} ms  (oracle={info['oracle_ms']:.1f} ms  "
-          f"cum={info['cum_regret_ms']:.0f} ms)")
+    print(f"  Prop delay : ISL={isl_ms:.2f} ms  |  GND={gnd_ms:.2f} ms")
+    print(f"  TrgSAT bg={trgsat_node.bg_load:.2f}  "
+          f"cost_ISL={cost_isl:.2f} ms  →  π_ISL[{task_type}]={sched.p_isl:.3f}")
+    print(f"  TN     bg={tn_node.bg_load:.2f}  "
+          f"cost_GND={cost_gnd:.2f} ms  →  π_GND[{task_type}]={sched.p_gnd:.3f}")
+    print(f"  Path selected  : {path}")
+    print(f"  Core delay : AMF={info['amf_ms']:.2f} ms  SMF={info['smf_ms']:.2f} ms  "
+          f"UPF={info['upf_ms']:.2f} ms  →  total={info['total_ms']:.2f} ms")
+    print(f"  Regret     : access={info['access_regret_ms']:.2f} ms  "
+          f"inst={info['inst_regret_ms']:.2f} ms  "
+          f"global={info['global_regret_ms']:.2f} ms  "
+          f"(cum_global={info['cum_global_regret_ms']:.0f} ms)")
     print(f"  Routing    : {dest_status}")
     print(f"  Promoting  : {state.tgt_name} → new srcSat  |  "
           f"{state.src_name} → retired")
@@ -437,6 +484,19 @@ def main():
 
     dispatcher      = Dispatcher(log_dir=_HERE)
     rand_dispatcher = RandomDispatcher(log_dir=_HERE)
+    # One PathScheduler per task type — each learns its own π_ISL / π_GND
+    path_schedulers: dict[str, PathScheduler] = {tt: PathScheduler() for tt in TASK_CYCLE}
+
+    # ── Access nodes (srcSAT decides path based on Xn setup cost) ────────────
+    # TrgSAT: onboard satellite node  (fast bg_load oscillation)
+    # TN:     ground datacenter node  (slow bg_load oscillation)
+    trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=5.0)
+    tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=2.0)
+
+    HO_BLOCK = 10  # HOs per task-type block before switching
+
+    ho_count  = 0            # total HOs fired
+    task_type = TASK_CYCLE[0]  # active task type; written to delays.json each tick
 
     # ── NE-ONE setup ──────────────────────────────────────────────────────────
     neone = None
@@ -493,6 +553,7 @@ def main():
         _write_delays(
             state.isl_delay_ms, state.sat_gnd_delay_ms,
             state.src_name, state.tgt_name, state.ue_tgt_elevation_deg,
+            task_type=task_type,
         )
         if neone is not None:
             neone.set_both(state.isl_delay_ms, state.sat_gnd_delay_ms)
@@ -513,8 +574,17 @@ def main():
             if reset_interval_s:
                 ho_reset_at = now_real + reset_interval_s
 
+            # Update access-node background loads and pick task type for this HO.
+            # Same task type is held for HO_BLOCK consecutive HOs so Bregman
+            # has time to converge within each block before the environment shifts.
+            trgsat_node.bg_load = trgsat_bg_load(ho_count)
+            tn_node.bg_load     = tn_bg_load(ho_count)
+            task_type           = TASK_CYCLE[(ho_count // HO_BLOCK) % len(TASK_CYCLE)]
+            ho_count           += 1
+
             _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG,
-                              dispatcher, rand_dispatcher)
+                              dispatcher, trgsat_node, tn_node, task_type,
+                              path_schedulers, rand_dispatcher)
 
             # Recompute state with the new pair for accurate display
             state = engine.state(unix_time=sim_time)

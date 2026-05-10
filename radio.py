@@ -270,13 +270,35 @@ class USRP:
         """
         Encode payload as a Packet and send one frame + guard silence.
         Returns the Packet that was sent (includes sequence number).
+
+        If the TX pipe breaks (Ethernet hiccup / buffer overflow), the burst
+        is terminated cleanly, the stream is reset, and the frame is retried
+        once before re-raising.
         """
         pkt = Packet(payload=payload, msg_id=msg_id, seq=self._seq)
         self._seq = (self._seq + 1) & 0xFF
 
         frame   = _build_frame(pkt)
         silence = np.zeros(SPS * 50, dtype=np.complex64)   # ~400 µs inter-frame gap
-        self._streamer.send(np.concatenate([frame, silence]), self._md)
+        samples = np.concatenate([frame, silence])
+
+        try:
+            self._streamer.send(samples, self._md)
+        except RuntimeError:
+            # Broken pipe — close the burst, wait, then restart and retry once.
+            md_eob = uhd.types.TXMetadata()
+            md_eob.end_of_burst = True
+            try:
+                self._streamer.send(np.zeros(100, dtype=np.complex64), md_eob)
+            except RuntimeError:
+                pass
+            time.sleep(0.1)
+            # Re-acquire a fresh TX streamer so the USRP is in a clean state.
+            self._streamer = self._usrp.get_tx_stream(uhd.usrp.StreamArgs("fc32", "sc16"))
+            self._md.start_of_burst = True
+            self._md.end_of_burst   = False
+            self._streamer.send(samples, self._md)   # raises if truly broken
+
         self._md.start_of_burst = False
         return pkt
 
@@ -354,11 +376,17 @@ class USRP:
         if self.role == "tx":
             md = uhd.types.TXMetadata()
             md.end_of_burst = True
-            self._streamer.send(np.zeros(100, dtype=np.complex64), md)
+            try:
+                self._streamer.send(np.zeros(100, dtype=np.complex64), md)
+            except RuntimeError:
+                pass   # pipe may already be broken; suppress so __exit__ doesn't raise
         else:
-            self._streamer.issue_stream_cmd(
-                uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
-            )
+            try:
+                self._streamer.issue_stream_cmd(
+                    uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
+                )
+            except RuntimeError:
+                pass
 
     def __enter__(self):  return self
     def __exit__(self, *_): self.close()

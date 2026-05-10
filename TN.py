@@ -42,7 +42,7 @@ NODE_NAME   = "TN"
 _HERE       = Path(__file__).resolve().parent
 DELAYS_FILE = _HERE / "delays.json"
 LOG_FILE    = _HERE / "TN_log.csv"
-LOG_HEADER  = ["timestamp", "seq", "msg_id", "prop_delay_ms", "gnd_ms"]
+LOG_HEADER  = ["timestamp", "seq", "msg_id", "task_type", "prop_delay_ms", "gnd_ms"]
 
 # ── NE-ONE hair-pin addresses (only used with --delay=NE-ONE) ─────────────────
 # Must match what you configured with `ip addr add` on the Linux machine:
@@ -137,6 +137,7 @@ def _neone_recv_loop(
             "timestamp":     datetime.now(tz=timezone.utc).isoformat(),
             "seq":           d.get("seq", -1),
             "msg_id":        d.get("msg_id", "0x00"),
+            "task_type":     d.get("payload", {}).get("task_type", "unknown"),
             "prop_delay_ms": round(delay_ms, 3),
             "gnd_ms":        round(gnd_ms, 3),
         }
@@ -230,6 +231,7 @@ def main():
                                     "timestamp":     datetime.now(tz=timezone.utc).isoformat(),
                                     "seq":           pkt.seq,
                                     "msg_id":        f"{pkt.msg_id:#04x}",
+                                    "task_type":     pkt.payload.get("task_type", "unknown"),
                                     "prop_delay_ms": round(delay_s * 1000, 3),
                                     "gnd_ms":        round(gnd_ms, 3),
                                 }

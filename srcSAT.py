@@ -16,15 +16,16 @@ Usage:
 """
 
 import argparse
+import json
 import random
 import time
+from pathlib import Path
 from radio import USRP
 
 DESTINATIONS = ["trgSAT", "TN"]
 
-# Destination override file — controller.py writes here on HO trigger.
-# srcSAT reads this to switch routing. Leave empty for random mode.
 DEST_OVERRIDE_FILE = "dest_override.txt"
+DELAYS_FILE        = Path(__file__).resolve().parent / "delays.json"
 
 BASE_MESSAGE = {
     "node_id":   "srcSAT",
@@ -48,6 +49,15 @@ def _read_dest_override() -> str | None:
     return None
 
 
+def _read_task_type() -> str:
+    """Read the current task type written by controller.py into delays.json."""
+    try:
+        with open(DELAYS_FILE) as f:
+            return json.load(f).get("task_type", "mixed")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "mixed"
+
+
 def main():
     p = argparse.ArgumentParser(description="USRP X310 BPSK Transmitter — srcSAT")
     p.add_argument("--addr",       default="192.168.20.6",  help="TX USRP IP address")
@@ -65,11 +75,12 @@ def main():
                 if args.dest:
                     dest = args.dest
                 else:
-                    dest = _read_dest_override() or random.choice(DESTINATIONS)
+                    dest      = _read_dest_override() or random.choice(DESTINATIONS)
+                task_type = _read_task_type()
 
-                msg = {**BASE_MESSAGE, "dest": dest}
+                msg = {**BASE_MESSAGE, "dest": dest, "task_type": task_type}
                 pkt = radio.transmit(msg, msg_id=0x01)
-                print(f"[srcSAT] seq={pkt.seq:03d}  dest={dest}", flush=True)
+                print(f"[srcSAT] seq={pkt.seq:03d}  dest={dest}  task={task_type}", flush=True)
 
         except KeyboardInterrupt:
             print(f"\nStopped. Last sent: {pkt}\n")
