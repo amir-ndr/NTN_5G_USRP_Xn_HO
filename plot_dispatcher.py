@@ -2,16 +2,15 @@
 """
 plot_dispatcher.py — Visualise dispatcher learning results
 
-6-panel figure:
-  1. Traffic split (frac_isl/frac_gnd) + normalised access-cost difference
-  2. End-to-end delay per HO — corrected running average excludes outliers
-  3. Per-task-type mean latency — Bregman vs Random (non-outlier HOs only)
-  4. Ground core — per-layer instance selection probabilities
-  5. Onboard core — per-layer instance selection probabilities
-  6. Cumulative regret with task-type bands
-
-Panels 1-2 and 4-6 show colour-coded task-type background bands with
-vertical dashed block boundaries so convergence spikes are explainable.
+8-panel figure (4×2 grid):
+  1. PathScheduler — learned π_ISL / π_GND  (Level-1 Bregman probabilities only)
+  2. Access cost signals — normalised cost_ISL vs cost_GND  (driving signal for Level-1)
+  3. End-to-end delay per HO — outlier-corrected running average
+  4. Per-task cumulative regret — 5 lines, one per task type
+  5. Per-task-type mean latency — Bregman vs Random (non-outlier HOs only)
+  6. Cumulative regret decomposition — access + NF instance + global
+  7. Ground Core — per-layer instance selection probabilities
+  8. Onboard Core — per-layer instance selection probabilities
 
 Usage:
     python3 plot_dispatcher.py
@@ -35,8 +34,8 @@ LOG_CSV  = _HERE / "dispatch_log.csv"
 RAND_CSV = _HERE / "random_log.csv"
 OUT_PNG  = _HERE / "results_dispatcher.png"
 
-CLIP_MS        = 70.0   # display clip — total_ms now includes access overhead
-OUTLIER_THRESH = 150.0  # exclude ISL+unstable-UPF hits from per-task averages
+CLIP_MS        = 70.0   # display clip for delay panel
+OUTLIER_THRESH = 150.0  # exclude from per-task averages
 
 C_ISL   = "#2196F3"
 C_GND   = "#FF5722"
@@ -53,6 +52,13 @@ TASK_COLORS = {
     "mixed":     "#E1BEE7",
 }
 TASK_BAR_COLORS = {
+    "gaming":    "#1E88E5",
+    "youtube":   "#E53935",
+    "browsing":  "#43A047",
+    "instagram": "#FB8C00",
+    "mixed":     "#8E24AA",
+}
+TASK_LINE_COLORS = {
     "gaming":    "#1E88E5",
     "youtube":   "#E53935",
     "browsing":  "#43A047",
@@ -85,8 +91,8 @@ def add_task_shading(ax, ho_ids: np.ndarray, task_types: list[str]) -> None:
         return
 
     blocks: list[tuple[float, float, str]] = []
-    prev_tt  = task_types[0]
-    start_x  = ho_ids[0]
+    prev_tt = task_types[0]
+    start_x = ho_ids[0]
 
     for i in range(1, len(ho_ids)):
         if task_types[i] != prev_tt:
@@ -110,11 +116,8 @@ def add_task_shading(ax, ho_ids: np.ndarray, task_types: list[str]) -> None:
 def rolling_mean_valid(
     values: np.ndarray, clip_ms: float, window: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Rolling mean that only counts non-clipped points toward the window.
-
-    Returns (position_indices, means) — index into values array.
-    """
-    n   = len(values)
+    """Rolling mean over non-clipped points only."""
+    n = len(values)
     out_x: list[int]   = []
     out_y: list[float] = []
     for i in range(n):
@@ -147,12 +150,12 @@ def main() -> None:
 
     colours  = [C_ISL if r["path"] == "ISL" else C_GND for r in rows]
 
-    prop_ms  = np.array([fv(r, "prop_ms")       for r in rows])
-    amf_ms   = np.array([fv(r, "amf_ms")        for r in rows])
-    smf_ms   = np.array([fv(r, "smf_ms")        for r in rows])
-    upf_ms   = np.array([fv(r, "upf_ms")        for r in rows])
-    total_ms = np.array([fv(r, "total_ms")      for r in rows])
-    oracle   = np.array([fv(r, "global_oracle_ms")     for r in rows])
+    prop_ms  = np.array([fv(r, "prop_ms")          for r in rows])
+    amf_ms   = np.array([fv(r, "amf_ms")           for r in rows])
+    smf_ms   = np.array([fv(r, "smf_ms")           for r in rows])
+    upf_ms   = np.array([fv(r, "upf_ms")           for r in rows])
+    total_ms = np.array([fv(r, "total_ms")          for r in rows])
+    oracle   = np.array([fv(r, "global_oracle_ms")  for r in rows])
 
     path_p_isl   = np.array([fv(r, "path_p_isl")      for r in rows])
     path_p_gnd   = np.array([fv(r, "path_p_gnd")      for r in rows])
@@ -161,6 +164,7 @@ def main() -> None:
     cum_access_reg = np.array([fv(r, "cum_access_regret_ms") for r in rows])
     cum_inst_reg   = np.array([fv(r, "cum_inst_regret_ms")   for r in rows])
     cum_global_reg = np.array([fv(r, "cum_global_regret_ms") for r in rows])
+    global_reg_ms  = np.array([fv(r, "global_regret_ms")     for r in rows])
 
     isl_mask   = np.array([r["path"] == "ISL" for r in rows])
     gnd_mask   = ~isl_mask
@@ -189,55 +193,79 @@ def main() -> None:
     nr = 0
 
     if has_rand:
-        nr             = len(rand_rows)
-        rand_ho_ids    = np.array([fv(r, "ho_id")         for r in rand_rows])
-        rand_colours   = [C_ISL if r["path"] == "ISL" else C_GND for r in rand_rows]
-        rand_total     = np.array([fv(r, "total_ms")      for r in rand_rows])
-        rand_cum_reg        = np.array([fv(r, "cum_global_regret_ms") for r in rand_rows])
-        rand_cum_access_reg = np.array([fv(r, "cum_access_regret_ms") for r in rand_rows])
-        rand_cum_inst_reg   = np.array([fv(r, "cum_inst_regret_ms")   for r in rand_rows])
-        rand_isl_mask  = np.array([r["path"] == "ISL"     for r in rand_rows])
-        rand_gnd_mask  = ~rand_isl_mask
+        nr              = len(rand_rows)
+        rand_ho_ids     = np.array([fv(r, "ho_id")         for r in rand_rows])
+        rand_colours    = [C_ISL if r["path"] == "ISL" else C_GND for r in rand_rows]
+        rand_total      = np.array([fv(r, "total_ms")      for r in rand_rows])
+        rand_cum_reg         = np.array([fv(r, "cum_global_regret_ms") for r in rand_rows])
+        rand_cum_access_reg  = np.array([fv(r, "cum_access_regret_ms") for r in rand_rows])
+        rand_cum_inst_reg    = np.array([fv(r, "cum_inst_regret_ms")   for r in rand_rows])
+        rand_isl_mask   = np.array([r["path"] == "ISL"     for r in rand_rows])
+        rand_gnd_mask   = ~rand_isl_mask
         rand_task_types = [r["task_type"] for r in rand_rows]
 
+    # ── Per-task cumulative regret (panel 4) ──────────────────────────────────
+    # For each task type, collect global_regret_ms in HO order, compute cumsum.
+    task_reg: dict[str, list[tuple[int, float]]] = {tt: [] for tt in TASK_ORDER}
+    for i, tt in enumerate(task_types):
+        task_reg[tt].append((int(ho_ids[i]), float(global_reg_ms[i])))
+
     # ── Figure layout ─────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(16, 14))
+    fig = plt.figure(figsize=(18, 25))
     fig.suptitle("NTN Dispatcher — Online Learning Results  (Bregman vs Random Baseline)",
                  fontsize=13, fontweight="bold")
-    gs = fig.add_gridspec(3, 2, hspace=0.46, wspace=0.32)
+    gs = fig.add_gridspec(5, 2, hspace=0.46, wspace=0.32)
 
-    ax_split = fig.add_subplot(gs[0, 0])
-    ax_del   = fig.add_subplot(gs[0, 1])
-    ax_task  = fig.add_subplot(gs[1, 0])
-    ax_gnd   = fig.add_subplot(gs[1, 1])
-    ax_on    = fig.add_subplot(gs[2, 0])
-    ax_reg   = fig.add_subplot(gs[2, 1])
+    ax_prob   = fig.add_subplot(gs[0, 0])   # 1. PathScheduler probs
+    ax_cost   = fig.add_subplot(gs[0, 1])   # 2. Access cost signals
+    ax_del    = fig.add_subplot(gs[1, 0])   # 3. End-to-end delay
+    ax_treg   = fig.add_subplot(gs[1, 1])   # 4. Per-task cumulative regret
+    ax_task   = fig.add_subplot(gs[2, 0])   # 5. Per-task mean latency
+    ax_reg    = fig.add_subplot(gs[2, 1])   # 6. Cumulative regret decomposition
+    ax_gnd    = fig.add_subplot(gs[3, 0])   # 7. Ground core probs
+    ax_on     = fig.add_subplot(gs[3, 1])   # 8. Onboard core probs
+    ax_lb     = fig.add_subplot(gs[4, :])   # 9. Load balancing (full width)
 
-    # ── 1. PathScheduler convergence (Level-1 Bregman) ───────────────────────
-    ax_split.set_title("PathScheduler — Learned π_ISL / π_GND  (Level-1 Bregman)")
-    ax_split.set_xlabel("Handover index")
-    ax_split.set_ylabel("Path probability / normalised access cost")
+    # ── 1. PathScheduler — learned π_ISL / π_GND ─────────────────────────────
+    ax_prob.set_title("PathScheduler — Learned π_ISL / π_GND  (Level-1 Bregman)")
+    ax_prob.set_xlabel("Handover index")
+    ax_prob.set_ylabel("Path probability")
 
-    ax_split.fill_between(ho_ids, path_p_isl, alpha=0.12, color=C_ISL)
-    ax_split.fill_between(ho_ids, path_p_gnd, alpha=0.12, color=C_GND)
-    ax_split.plot(ho_ids, path_p_isl, color=C_ISL, lw=1.6, label="π_ISL (learned)")
-    ax_split.plot(ho_ids, path_p_gnd, color=C_GND, lw=1.6, label="π_GND (learned)")
-    ax_split.axhline(0.5, color="gray", ls="--", lw=0.8, alpha=0.5, label="uniform (random)")
+    ax_prob.fill_between(ho_ids, path_p_isl, alpha=0.12, color=C_ISL)
+    ax_prob.fill_between(ho_ids, path_p_gnd, alpha=0.12, color=C_GND)
+    ax_prob.plot(ho_ids, path_p_isl, color=C_ISL, lw=1.8, label="π_ISL (learned)")
+    ax_prob.plot(ho_ids, path_p_gnd, color=C_GND, lw=1.8, label="π_GND (learned)")
+    ax_prob.axhline(0.5, color="gray", ls="--", lw=0.8, alpha=0.5, label="uniform (random)")
 
-    # Normalised access costs overlaid to show WHY the scheduler shifts
-    cd_isl = (acc_cost_isl - acc_cost_isl.min()) / max(float(acc_cost_isl.max() - acc_cost_isl.min()), 1e-6)
-    cd_gnd = (acc_cost_gnd - acc_cost_gnd.min()) / max(float(acc_cost_gnd.max() - acc_cost_gnd.min()), 1e-6)
-    ax_split.plot(ho_ids, cd_isl, color=C_ISL, lw=0.8, ls=":", alpha=0.45,
-                  label="cost_ISL [norm]")
-    ax_split.plot(ho_ids, cd_gnd, color=C_GND, lw=0.8, ls=":", alpha=0.45,
-                  label="cost_GND [norm]")
+    add_task_shading(ax_prob, ho_ids, task_types)
+    ax_prob.set_ylim(0, 1.12)
+    ax_prob.legend(fontsize=8, loc="upper right")
+    ax_prob.grid(True, alpha=0.3)
 
-    add_task_shading(ax_split, ho_ids, task_types)
-    ax_split.set_ylim(0, 1.12)
-    ax_split.legend(fontsize=7.5, loc="upper right", ncol=2)
-    ax_split.grid(True, alpha=0.3)
+    # ── 2. Access cost signals — driving signal for PathScheduler ─────────────
+    ax_cost.set_title("Access Cost Signals — ISL vs GND  (Level-1 Bregman input)")
+    ax_cost.set_xlabel("Handover index")
+    ax_cost.set_ylabel("Access cost (ms)")
 
-    # ── 2. Total delay per HO (outlier-corrected running average) ────────────
+    ax_cost.plot(ho_ids, acc_cost_isl, color=C_ISL, lw=0.9, alpha=0.7, label="cost_ISL (ms)")
+    ax_cost.plot(ho_ids, acc_cost_gnd, color=C_GND, lw=0.9, alpha=0.7, label="cost_GND (ms)")
+
+    # Rolling mean for readability
+    win_c = max(1, min(15, n // 8))
+    _, isl_rm = rolling_mean_valid(acc_cost_isl, 1e9, win_c)
+    _, gnd_rm = rolling_mean_valid(acc_cost_gnd, 1e9, win_c)
+    x_rm = np.arange(len(isl_rm))
+    if len(x_rm) > 1:
+        ax_cost.plot(ho_ids[x_rm], isl_rm, color=C_ISL, lw=1.8,
+                     label=f"ISL avg (w={win_c})")
+        ax_cost.plot(ho_ids[x_rm], gnd_rm, color=C_GND, lw=1.8,
+                     label=f"GND avg (w={win_c})")
+
+    add_task_shading(ax_cost, ho_ids, task_types)
+    ax_cost.legend(fontsize=7.5, ncol=2)
+    ax_cost.grid(True, alpha=0.3)
+
+    # ── 3. Total delay per HO ─────────────────────────────────────────────────
     total_ms_clipped = np.minimum(total_ms, CLIP_MS)
     is_clipped       = total_ms > CLIP_MS
     n_clipped        = int(is_clipped.sum())
@@ -275,7 +303,7 @@ def main() -> None:
 
     oracle_clipped = np.minimum(oracle, CLIP_MS)
     ax_del.plot(ho_ids, oracle_clipped, color=C_BEST, lw=1.2, ls="--",
-                label="Within-path oracle", zorder=5)
+                label="Global oracle", zorder=5)
 
     WIN_B = max(1, min(20, n // 4))
     bx_idx, by = rolling_mean_valid(total_ms, CLIP_MS, WIN_B)
@@ -294,14 +322,34 @@ def main() -> None:
     ax_del.legend(fontsize=7.5, handles=legend_handles)
     ax_del.grid(True, alpha=0.3)
 
-    # ── 3. Per-task-type mean latency ────────────────────────────────────────
+    # ── 4. Per-task cumulative regret ─────────────────────────────────────────
+    ax_treg.set_title("Per-Task Cumulative Regret  (global regret by task type)")
+    ax_treg.set_xlabel("Per-task handover index")
+    ax_treg.set_ylabel("Cumulative regret (ms)")
+
+    for tt in TASK_ORDER:
+        entries = task_reg[tt]
+        if not entries:
+            continue
+        reg_vals = np.array([v for _, v in entries])
+        cum_r    = np.cumsum(reg_vals)
+        x_idx    = np.arange(1, len(cum_r) + 1)
+        ax_treg.plot(x_idx, cum_r, color=TASK_LINE_COLORS[tt],
+                     lw=1.6, label=f"{tt} (n={len(cum_r)})")
+
+    ax_treg.legend(fontsize=8, ncol=1, loc="upper left")
+    ax_treg.grid(True, alpha=0.3)
+    ax_treg.annotate("x-axis = per-task HO count (not global)",
+                     xy=(0.99, 0.02), xycoords="axes fraction",
+                     ha="right", va="bottom", fontsize=6, color="gray")
+
+    # ── 5. Per-task-type mean latency ─────────────────────────────────────────
     ax_task.set_title(
         f"Mean Total Latency by Task Type  (non-outlier HOs < {OUTLIER_THRESH:.0f} ms)"
     )
     ax_task.set_xlabel("Task type")
     ax_task.set_ylabel("Mean total delay (ms)")
 
-    # Components to stack: (csv_key, display_label, solid_colour, alpha_hatch)
     COMP_SPECS = [
         ("prop_ms", "Propagation", "#90CAF9", 0.95),
         ("amf_ms",  "AMF",         "#1565C0", 0.90),
@@ -310,7 +358,6 @@ def main() -> None:
     ]
     comp_keys = [c[0] for c in COMP_SPECS]
 
-    # Per-task, per-component lists (only non-outlier HOs)
     task_bregman: dict[str, dict[str, list[float]]] = {
         tt: {k: [] for k in comp_keys} for tt in TASK_ORDER
     }
@@ -376,7 +423,6 @@ def main() -> None:
                                  fontsize=5.5, color="#222222", fontweight="bold")
                 r_bottom += r_mean
 
-        # Total + count annotation above each bar
         if b_total > 0.2:
             ax_task.text(x_task[gi] - bar_w / 2, b_bottom + 0.2,
                          f"{b_total:.1f}\nn={b_n}",
@@ -389,7 +435,6 @@ def main() -> None:
     ax_task.set_xticks(x_task)
     ax_task.set_xticklabels([t.capitalize() for t in TASK_ORDER], fontsize=9)
 
-    # Legend: component colours + Bregman/Random distinction
     comp_handles = [mpatches.Patch(color=clr, alpha=al, label=lbl)
                     for _, lbl, clr, al in COMP_SPECS]
     bregman_h = mpatches.Patch(color="#888888", alpha=0.88, label="Bregman (solid)")
@@ -403,49 +448,11 @@ def main() -> None:
                      xy=(0.01, 0.98), xycoords="axes fraction",
                      va="top", fontsize=6.5, color="gray")
 
-    # ── 4. Ground core — per-layer instance probabilities ────────────────────
-    ax_gnd.set_title("Ground Core — Instance Selection Probabilities")
-    ax_gnd.set_xlabel("Handover index")
-    ax_gnd.set_ylabel("Selection probability")
-
-    styles = ["-", "--", ":"]
-    for i, (prob, sty) in enumerate(zip(gnd_amf_p, styles)):
-        ax_gnd.plot(ho_ids, prob, color="#1565C0", ls=sty, lw=1.2, label=f"AMF-GND-{i}")
-    for i, (prob, sty) in enumerate(zip(gnd_smf_p, styles)):
-        ax_gnd.plot(ho_ids, prob, color="#FF5722", ls=sty, lw=1.2, label=f"SMF-GND-{i}")
-    for i, (prob, sty) in enumerate(zip(gnd_upf_p, styles)):
-        ax_gnd.plot(ho_ids, prob, color="#4CAF50", ls=sty, lw=1.2, label=f"UPF-GND-{i}")
-
-    add_task_shading(ax_gnd, ho_ids, task_types)
-    ax_gnd.axhline(1 / 3, color="gray", ls="--", lw=0.6, alpha=0.5)
-    ax_gnd.set_ylim(0, 1.10)
-    ax_gnd.legend(fontsize=7, ncol=3)
-    ax_gnd.grid(True, alpha=0.3)
-
-    # ── 5. Onboard core — per-layer instance probabilities ───────────────────
-    ax_on.set_title("Onboard Core — Instance Selection Probabilities")
-    ax_on.set_xlabel("Handover index")
-    ax_on.set_ylabel("Selection probability")
-
-    for i, (prob, sty) in enumerate(zip(on_amf_p, styles)):
-        ax_on.plot(ho_ids, prob, color="#1565C0", ls=sty, lw=1.2, label=f"AMF-ON-{i}")
-    for i, (prob, sty) in enumerate(zip(on_smf_p, styles)):
-        ax_on.plot(ho_ids, prob, color="#FF5722", ls=sty, lw=1.2, label=f"SMF-ON-{i}")
-    for i, (prob, sty) in enumerate(zip(on_upf_p, styles)):
-        ax_on.plot(ho_ids, prob, color="#4CAF50", ls=sty, lw=1.2, label=f"UPF-ON-{i}")
-
-    add_task_shading(ax_on, ho_ids, task_types)
-    ax_on.axhline(1 / 3, color="gray", ls="--", lw=0.6, alpha=0.5)
-    ax_on.set_ylim(0, 1.10)
-    ax_on.legend(fontsize=7, ncol=3)
-    ax_on.grid(True, alpha=0.3)
-
-    # ── 6. Cumulative regret — decomposed (access + instance) ────────────────
+    # ── 6. Cumulative regret — decomposed ────────────────────────────────────
     ax_reg.set_title("Cumulative Regret Decomposition  (access + NF instance)")
     ax_reg.set_xlabel("Handover index")
     ax_reg.set_ylabel("Cumulative regret (ms)")
 
-    # Bregman: stacked access + instance regret
     ax_reg.fill_between(ho_ids, cum_global_reg, alpha=0.18, color="black", zorder=2)
     ax_reg.fill_between(ho_ids, cum_inst_reg,   alpha=0.30, color="#1565C0",
                         label="Bregman inst regret", zorder=3)
@@ -466,6 +473,106 @@ def main() -> None:
     ax_reg.legend(fontsize=8, ncol=2)
     ax_reg.grid(True, alpha=0.3)
 
+    # ── 7. Ground core — per-layer instance probabilities ────────────────────
+    ax_gnd.set_title("Ground Core — Instance Selection Probabilities")
+    ax_gnd.set_xlabel("Handover index")
+    ax_gnd.set_ylabel("Selection probability")
+
+    styles = ["-", "--", ":"]
+    for i, (prob, sty) in enumerate(zip(gnd_amf_p, styles)):
+        ax_gnd.plot(ho_ids, prob, color="#1565C0", ls=sty, lw=1.2, label=f"AMF-GND-{i}")
+    for i, (prob, sty) in enumerate(zip(gnd_smf_p, styles)):
+        ax_gnd.plot(ho_ids, prob, color="#FF5722", ls=sty, lw=1.2, label=f"SMF-GND-{i}")
+    for i, (prob, sty) in enumerate(zip(gnd_upf_p, styles)):
+        ax_gnd.plot(ho_ids, prob, color="#4CAF50", ls=sty, lw=1.2, label=f"UPF-GND-{i}")
+
+    add_task_shading(ax_gnd, ho_ids, task_types)
+    ax_gnd.axhline(1 / 3, color="gray", ls="--", lw=0.6, alpha=0.5)
+    ax_gnd.set_ylim(0, 1.10)
+    ax_gnd.legend(fontsize=7, ncol=3)
+    ax_gnd.grid(True, alpha=0.3)
+    ax_gnd.annotate("UPF probs reflect current task type's per-task scheduler",
+                    xy=(0.01, 0.98), xycoords="axes fraction",
+                    va="top", fontsize=6, color="gray")
+
+    # ── 8. Onboard core — per-layer instance probabilities ───────────────────
+    ax_on.set_title("Onboard Core — Instance Selection Probabilities")
+    ax_on.set_xlabel("Handover index")
+    ax_on.set_ylabel("Selection probability")
+
+    for i, (prob, sty) in enumerate(zip(on_amf_p, styles)):
+        ax_on.plot(ho_ids, prob, color="#1565C0", ls=sty, lw=1.2, label=f"AMF-ON-{i}")
+    for i, (prob, sty) in enumerate(zip(on_smf_p, styles)):
+        ax_on.plot(ho_ids, prob, color="#FF5722", ls=sty, lw=1.2, label=f"SMF-ON-{i}")
+    for i, (prob, sty) in enumerate(zip(on_upf_p, styles)):
+        ax_on.plot(ho_ids, prob, color="#4CAF50", ls=sty, lw=1.2, label=f"UPF-ON-{i}")
+
+    add_task_shading(ax_on, ho_ids, task_types)
+    ax_on.axhline(1 / 3, color="gray", ls="--", lw=0.6, alpha=0.5)
+    ax_on.set_ylim(0, 1.10)
+    ax_on.legend(fontsize=7, ncol=3)
+    ax_on.grid(True, alpha=0.3)
+    ax_on.annotate("UPF probs reflect current task type's per-task scheduler",
+                   xy=(0.01, 0.98), xycoords="axes fraction",
+                   va="top", fontsize=6, color="gray")
+
+    # ── 9. Load balancing — bg_load vs learned routing probabilities (full width) ──
+    ax_lb.set_title(
+        "Access Node Load Balancing — bg_load vs Learned π_ISL  "
+        "(ISL wins when bg_load_ISL < ~0.67; tradeoff is xn_setup, not propagation)"
+    )
+    ax_lb.set_xlabel("Handover index")
+    ax_lb.set_ylabel("Probability / bg_load  [0 – 1]")
+
+    trgsat_bg_arr = np.array([fv(r, "trgsat_bg") for r in rows])
+    tn_bg_arr     = np.array([fv(r, "tn_bg")     for r in rows])
+
+    # inv_cost_p_isl was added in a later schema version; fall back to computing
+    # it from the always-present access_cost_isl / access_cost_gnd columns.
+    if "inv_cost_p_isl" in rows[0]:
+        inv_p_isl = np.array([fv(r, "inv_cost_p_isl") for r in rows])
+    else:
+        c_isl = np.array([fv(r, "access_cost_isl") for r in rows])
+        c_gnd = np.array([fv(r, "access_cost_gnd") for r in rows])
+        w_isl = 1.0 / np.maximum(c_isl, 0.01)
+        w_gnd = 1.0 / np.maximum(c_gnd, 0.01)
+        inv_p_isl = w_isl / (w_isl + w_gnd)
+
+    # Background load fills — show congestion level of each node over time
+    ax_lb.fill_between(ho_ids, trgsat_bg_arr, alpha=0.18, color=C_ISL,
+                       label="bg_load ISL (TrgSAT)")
+    ax_lb.fill_between(ho_ids, tn_bg_arr,     alpha=0.18, color=C_GND,
+                       label="bg_load GND (TN)")
+    ax_lb.plot(ho_ids, trgsat_bg_arr, color=C_ISL, lw=0.8, alpha=0.5)
+    ax_lb.plot(ho_ids, tn_bg_arr,     color=C_GND, lw=0.8, alpha=0.5)
+
+    # Crossover reference: ISL/GND costs are equal around bg_load_ISL ≈ 0.67
+    ax_lb.axhline(0.67, color="#888888", ls=":", lw=1.0, alpha=0.6,
+                  label="bg_ISL ≈ 0.67  (ISL↔GND cost crossover)")
+
+    # Inverse-cost target: what a perfect instantaneous load-balancer routes to ISL
+    win_lb = max(1, min(20, n // 6))
+    _, ic_rm = rolling_mean_valid(inv_p_isl, 1e9, win_lb)
+    x_lb = np.arange(len(ic_rm))
+    if len(x_lb) > 1:
+        ax_lb.plot(ho_ids[x_lb], ic_rm, color="black", lw=1.4, ls="--",
+                   label=f"Inv-cost π_ISL (greedy optimum, avg w={win_lb})")
+
+    # Bregman learned probability
+    ax_lb.plot(ho_ids, path_p_isl, color=C_ISL, lw=2.0,
+               label="π_ISL  (Bregman learned)")
+
+    add_task_shading(ax_lb, ho_ids, task_types)
+    ax_lb.set_ylim(0, 1.05)
+    ax_lb.legend(fontsize=8, ncol=3, loc="upper right")
+    ax_lb.grid(True, alpha=0.3)
+    ax_lb.annotate(
+        "When bg_load_ISL (blue fill) rises above ~0.67, "
+        "greedy optimum (dashed) drops → Bregman π_ISL should follow with a lag",
+        xy=(0.01, 0.03), xycoords="axes fraction",
+        va="bottom", fontsize=7, color="#444444",
+    )
+
     # ── Summary ───────────────────────────────────────────────────────────────
     isl_count = int(isl_mask.sum())
     gnd_count = int(gnd_mask.sum())
@@ -480,6 +587,15 @@ def main() -> None:
     print(f"  Task type distribution:")
     for tt, cnt in sorted(tc.items()):
         print(f"    {tt:<12}: {cnt:>4}  ({100*cnt/n:.1f}%)")
+
+    print(f"{'─'*62}")
+    print(f"  Per-task cumulative regret (global):")
+    for tt in TASK_ORDER:
+        entries = task_reg[tt]
+        if entries:
+            cum = sum(v for _, v in entries)
+            avg = cum / len(entries)
+            print(f"    {tt:<12}: cum={cum:.1f} ms  avg/HO={avg:.2f} ms  n={len(entries)}")
 
     print(f"{'─'*62}")
     print(f"  Per-task mean latency breakdown (non-outlier < {OUTLIER_THRESH:.0f} ms):")
@@ -510,8 +626,8 @@ def main() -> None:
         print(f"  Random  GND selected : {rg:>4}  ({100*rg/nr:.1f}%)")
 
     print(f"{'─'*62}")
-    oracle = np.array([fv(r, "global_oracle_ms") for r in rows])
-    print(f"  Global oracle avg      : {oracle.mean():.2f} ms")
+    oracle_arr = np.array([fv(r, "global_oracle_ms") for r in rows])
+    print(f"  Global oracle avg      : {oracle_arr.mean():.2f} ms")
     print(f"  Bregman access regret  : avg={cum_access_reg[-1]/n:.2f} ms  "
           f"(cum={cum_access_reg[-1]:.1f} ms)")
     print(f"  Bregman inst   regret  : avg={cum_inst_reg[-1]/n:.2f} ms  "

@@ -45,6 +45,7 @@ import argparse
 import json
 import math
 import os
+import random
 import signal
 import time
 from collections import defaultdict
@@ -110,6 +111,31 @@ NE_ONE_ISL_LINK = "1"              # ← link ID for ISL  pipe in NE-ONE
 NE_ONE_GND_LINK = "2"              # ← link ID for GND pipe in NE-ONE
 NE_ONE_USER     = ""               # HTTP Basic auth username (leave "" if none)
 NE_ONE_PASS     = ""               # HTTP Basic auth password (leave "" if none)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Task-type Markov switching ────────────────────────────────────────────────
+# After MIN_TASK_HOS handovers, the current task type transitions according to
+# this stochastic matrix.  Self-transitions keep the same type; effective mean
+# session length ≈ MIN_TASK_HOS / (1 − self_prob).  Row order matches TASK_CYCLE.
+#
+# Design goal: near-uniform stationary distribution so all 5 task types each
+# receive ~20% of HOs → every per-task PathScheduler and UPF LayerScheduler
+# gets enough samples to learn.  With MIN_TASK_HOS=15 and ~120 total HOs we
+# get ~8 task blocks; self-prob=0.25 gives mean block length 15/(1−0.25)=20 HOs.
+#
+# The slight asymmetries below reflect real traffic flow (gaming rarely jumps to
+# instagram; browsing naturally transitions to youtube/mixed) while keeping the
+# stationary distribution close to [0.20, 0.20, 0.20, 0.20, 0.20].
+MIN_TASK_HOS = 15   # minimum HOs per task block before next transition is sampled
+
+TASK_MARKOV: dict[str, list[float]] = {
+    #              gaming  youtube  browsing  instagram  mixed
+    "gaming":     [0.25,   0.20,    0.20,     0.15,     0.20],
+    "youtube":    [0.15,   0.25,    0.20,     0.20,     0.20],
+    "browsing":   [0.20,   0.20,    0.25,     0.15,     0.20],
+    "instagram":  [0.15,   0.20,    0.20,     0.25,     0.20],
+    "mixed":      [0.20,   0.20,    0.20,     0.20,     0.20],   # truly uniform
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -299,7 +325,7 @@ def _trigger_handover(
       1. Compute access costs for both paths
       2. Level-1: per-task-type PathScheduler samples path (Bregman mirror descent)
       3. Level-2: Dispatcher selects AMF/SMF/UPF instances (Bregman)
-      4. PathScheduler updated with access_cost of chosen path (paper gradient signal)
+      4. PathScheduler updated with BOTH access costs (full-information Bregman)
       5. RandomDispatcher: 50/50 random path + uniform NF (baseline)
       6. Write dest_override.txt, promote tgtSat, scan for next tgtSat
 
@@ -307,6 +333,21 @@ def _trigger_handover(
     """
     isl_ms = state.isl_delay_ms
     gnd_ms = state.sat_gnd_delay_ms
+
+    # ── Physical bounds guard — reject SGP4 garbage from TLE epoch overflow ──
+    # LEO ISL physical max ≈ 8.3 ms (2500 km); LEO-GND physical max ≈ 3.7 ms (1123 km).
+    # Anything above these generous thresholds means TLE validity window exceeded.
+    _MAX_ISL_MS = 100.0
+    _MAX_GND_MS = 50.0
+    if isl_ms > _MAX_ISL_MS or gnd_ms > _MAX_GND_MS:
+        print(
+            f"  [HO SKIPPED] Propagation delay out of physical bounds: "
+            f"ISL={isl_ms:.1f} ms  GND={gnd_ms:.1f} ms  "
+            f"(TLE epoch likely exceeded — recommend restarting simulation or "
+            f"capping at ≤150 HOs with the current starlink.tle)"
+        )
+        return False
+    # ─────────────────────────────────────────────────────────────────────────
 
     # ── Level-1: access costs + per-task Bregman PathScheduler ──────────────
     cost_isl = trgsat_node.total_access_cost_ms(isl_ms)
@@ -329,9 +370,8 @@ def _trigger_handover(
         tn_bg           = tn_node.bg_load,
     )
 
-    # Update Level-1 scheduler with access cost of chosen path (paper gradient signal)
-    access_cost_chosen = cost_isl if path == "ISL" else cost_gnd
-    sched.update(path, access_cost_chosen)
+    # Full-information Bregman update: both access costs observed every round
+    sched.update(cost_isl, cost_gnd)
 
     # ── Random baseline: 50/50 path + uniform NF (independent of Bregman) ────
     if rand_dispatcher is not None:
@@ -488,15 +528,19 @@ def main():
     path_schedulers: dict[str, PathScheduler] = {tt: PathScheduler() for tt in TASK_CYCLE}
 
     # ── Access nodes (srcSAT decides path based on Xn setup cost) ────────────
-    # TrgSAT: onboard satellite node  (fast bg_load oscillation)
-    # TN:     ground datacenter node  (slow bg_load oscillation)
-    trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=5.0)
-    tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=2.0)
+    # TrgSAT: onboard satellite node  — fast bg_load oscillation [0.20, 0.85], period 120 HOs
+    #   xn_base_ms=2.0: ISL Xn preparation is lightweight (direct sat-to-sat, no core hops)
+    # TN:     ground datacenter node  — slow bg_load oscillation [0.10, 0.60], period 300 HOs
+    #   xn_base_ms=5.0: GND Xn involves more core-network signaling (AMF, UPF anchoring)
+    #
+    # Tradeoff: ISL wins when trgSAT bg_load < ~0.65 (cost_ISL < cost_GND);
+    #           once bg_load_ISL > 0.65, cost_ISL > cost_GND → PathScheduler shifts to GND.
+    trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=2.0)
+    tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=5.0)
 
-    HO_BLOCK = 10  # HOs per task-type block before switching
-
-    ho_count  = 0            # total HOs fired
-    task_type = TASK_CYCLE[0]  # active task type; written to delays.json each tick
+    ho_count      = 0            # total HOs fired
+    task_type     = random.choice(TASK_CYCLE)   # random start — no single task gets a head start
+    task_ho_count = 0            # HOs elapsed since last task transition
 
     # ── NE-ONE setup ──────────────────────────────────────────────────────────
     neone = None
@@ -574,13 +618,24 @@ def main():
             if reset_interval_s:
                 ho_reset_at = now_real + reset_interval_s
 
-            # Update access-node background loads and pick task type for this HO.
-            # Same task type is held for HO_BLOCK consecutive HOs so Bregman
-            # has time to converge within each block before the environment shifts.
+            # Update background loads for this HO.
             trgsat_node.bg_load = trgsat_bg_load(ho_count)
             tn_node.bg_load     = tn_bg_load(ho_count)
-            task_type           = TASK_CYCLE[(ho_count // HO_BLOCK) % len(TASK_CYCLE)]
-            ho_count           += 1
+            ho_count       += 1
+            task_ho_count  += 1
+
+            # Markov task switching: after MIN_TASK_HOS HOs sample the next task.
+            # Self-transitions keep the current type; the minimum block of
+            # MIN_TASK_HOS HOs ensures each per-task scheduler sees enough data
+            # before the environment can shift.
+            if task_ho_count >= MIN_TASK_HOS:
+                prev_task     = task_type
+                task_type     = random.choices(TASK_CYCLE,
+                                               weights=TASK_MARKOV[task_type])[0]
+                task_ho_count = 0
+                if task_type != prev_task:
+                    print(f"  [Task switch]  {prev_task} → {task_type}  "
+                          f"(after {MIN_TASK_HOS} HOs)", flush=True)
 
             _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG,
                               dispatcher, trgsat_node, tn_node, task_type,

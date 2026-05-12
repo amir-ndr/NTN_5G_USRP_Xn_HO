@@ -9,16 +9,35 @@ Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
   Level 1 — PathScheduler (access layer, lives in controller.py):
       One scheduler PER TASK TYPE — each learns its own π_ISL / π_GND.
       Gradient signal: x_{i',i} = α(access_cost_i − τ_access)
-      Cost function:   L(B·x) = log(1 + B·x)  where B = 1 (path-level scale)
+      Cost function:   L(x) = log(1 + x)  (B=1 at the path level — no service-rate term)
       Update rule (positive Bregman multiplicative weights):
-        log_w[chosen] += η_path · (1 / (1 + max(x, −0.999)))
+        log_w[i'] += η_path · min(1/(1 + max(x,−0.999)), GRAD_CAP)
+      PathScheduler does NOT call CoreInstance.grad_L(), so the B-factor fix to
+      CoreInstance.grad_L does not affect Level-1 updates.
 
       Regret_access[t] = access_cost_chosen[t] − min(cost_isl[t], cost_gnd[t])
 
   Level 2 — LayerScheduler (NF/compute layer, lives here):
       Learns π_AMF / π_SMF / π_UPF per layer per path.
       Gradient signal: per-instance sojourn delay (G/G/1 Kingman).
-      Task-type aware via hardware-derived utilization (ρ).
+      Update rule:  weights[i] *= exp(η_x · min(B_i/(1+B_i·x_i), GRAD_CAP))
+        where x_i = α(w_i − τ_max),  B_i = 1/τ_i  (service rate of instance i).
+      UPF has one LayerScheduler PER TASK TYPE (per-task CPR → different ρ → different
+      learned weights). AMF/SMF are shared across task types (fixed_cpr is task-independent).
+
+      Local-only gradient (no recursive cost relay): AMF, SMF, and UPF are independent
+      queues — AMF's instance choice does not affect SMF or UPF load, so propagating
+      downstream costs into upstream gradient signals would penalise correct AMF choices
+      whenever UPF is overloaded (wrong signal attribution).
+
+      B-parameter update (exploitation arm): B_i = 1/τ_i is derived from fixed hardware
+      specs and never updated. Dynamic CPU reallocation (changing millicores per instance)
+      would constitute the paper's exploitation sub-problem, but requires the paper's
+      exact projected-gradient formula and feasible-set bounds to implement correctly.
+
+      Queue state across HOs: G/G/1 steady-state captures queuing within a round.
+      HO events are ~5400 simulated seconds apart; queues drain between events, so
+      per-round stateless queuing is appropriate at this time scale.
 
       Regret_inst[t] = core_ms[t] − oracle_compute_ms[t]  (within chosen path)
 
@@ -58,22 +77,37 @@ import numpy as np
 #  Algorithm hyperparameters
 # ══════════════════════════════════════════════════════════════════════════════
 
-N_TASKS      = 1000   # tasks per HO slot (paper §IV: 10^3 registration burst)
-TAU_MAX      = 5.0    # per-instance sojourn threshold (ms) — Level-2 LayerScheduler
-TAU_ACCESS   = 15.0   # access-cost threshold (ms) — Level-1 PathScheduler: x = α(c−τ_a)
+# Per-task concurrent request counts — affects ρ = N × CPR / capacity_hz.
+# Differentiated by traffic profile: gaming is a single session with low packet
+# rate; instagram involves many simultaneous media requests at high volume.
+# N also drives AMF/SMF utilisation (fixed CPR) so all layers are task-aware.
+TASK_N_TASKS: dict[str, int] = {
+    "gaming":    400,   # single gaming session, low packet rate
+    "youtube":   700,   # streaming + metadata, moderate burst
+    "browsing":  900,   # multiple tabs, DNS + page requests
+    "instagram": 1000,  # media-heavy, many small concurrent requests
+    "mixed":     800,   # average of above
+}
+
+TAU_ACCESS   = 12.0   # access-cost threshold (ms) — Level-1 PathScheduler: x = α(c−τ_a)
+# Per-instance τ_max is now embedded in each CoreInstance spec tuple (8th element).
+# Rationale: TN (GND) instances run on high-clock server CPUs → stricter deadlines;
+# NTN (ON) instances run on power-limited onboard CPUs → relaxed deadlines.
+# Values chosen so each instance's expected delay sits near its τ_max at mid-load,
+# giving the LayerScheduler gradient differentiation across load regimes.
 ALPHA        = 0.1    # cost-signal scaling for both levels:  x = α(w − τ)
 ETA_X        = 0.05   # Level-2 (NF compute) Bregman step
-ETA_PATH     = 0.5    # Level-1 (path) Bregman step — positive multiplicative weights
+ETA_PATH     = 0.2    # Level-1 (path) Bregman step — positive multiplicative weights
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
 PROB_FLOOR   = 0.05   # minimum probability per NF instance (exploration floor)
 
 # ── Task types: UPF cycles per request ───────────────────────────────────────
 TASK_TYPES: dict[str, int] = {
-    "gaming":    783_333,    # UPF-ON-0 ρ≈0.435 (stable); GND-0 ρ≈0.112
-    "youtube":   3_011_111,  # all ISL UPFs unstable (ρ>1); GND-0 ρ≈0.430
-    "browsing":  2_750_000,  # all ISL UPFs unstable; GND-0 ρ≈0.393
-    "instagram": 4_500_000,  # all ISL UPFs unstable; GND-0 ρ≈0.643; GND-2 unstable
-    "mixed":     3_500_000,  # all ISL UPFs unstable; GND-0/1 stable
+    "gaming":    783_333,    # UPF-ON-0 ρ≈0.435 E[W]≈0.67ms; GND-0 ρ≈0.112
+    "youtube":   1_400_000,  # UPF-ON-0 ρ≈0.778 E[W]≈2.65ms; GND-0 ρ≈0.200
+    "browsing":  1_100_000,  # UPF-ON-0 ρ≈0.611 E[W]≈1.27ms; GND-0 ρ≈0.157
+    "instagram": 1_600_000,  # UPF-ON-0 ρ≈0.889 E[W]≈5.77ms (>τ_max); GND-0 ρ≈0.229
+    "mixed":     1_200_000,  # UPF-ON-0 ρ≈0.667 E[W]≈1.58ms; GND-0 ρ≈0.171
 }
 TASK_CYCLE = ["gaming", "youtube", "browsing", "instagram", "mixed"]
 
@@ -82,38 +116,59 @@ SMF_CYCLES = 500_000    # PDU session establishment: ~5×10^5 cycles
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Hardware instance specs
-#  (name, millicores, cpu_freq_ghz, is_onboard, fixed_cpr, cs, ca)
+#  (name, millicores, cpu_freq_ghz, is_onboard, fixed_cpr, cs, ca, tau_max_ms)
+#
+#  τ_max_ms is per-instance, per-stage, per-path (paper §III-B "timeout thresholds
+#  across each functional stage").  Design rule:
+#    ON  instances: relaxed — onboard CPUs are slower, higher variance acceptable
+#    GND instances: strict  — server CPUs are fast; delay above threshold is a signal
+#  Each value is set near the mid-load expected sojourn so the gradient is informative
+#  across the full load range (not clamped to the boundary on either extreme).
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ON_AMF_SPECS = [
-    ("AMF-ON-0",  500, 1.5, True,  400_000, 0.80, 1.00),   # ρ≈0.533; τ≈0.53 ms
-    ("AMF-ON-1",  350, 1.5, True,  400_000, 0.90, 1.00),   # ρ≈0.762
-    ("AMF-ON-2",  200, 1.5, True,  400_000, 1.05, 1.00),   # ρ≈1.333 → unstable
+    # mid-load E[W]: ON-0≈0.94ms, ON-1≈2.27ms  →  τ_max=1.5ms splits them cleanly
+    ("AMF-ON-0",  500, 1.5, True,  400_000, 0.80, 1.00, 1.5),
+    ("AMF-ON-1",  350, 1.5, True,  400_000, 0.90, 1.00, 1.5),
+    ("AMF-ON-2",  200, 1.5, True,  400_000, 1.05, 1.00, 1.5),   # ρ>1 → unstable
 ]
 _GND_AMF_SPECS = [
-    ("AMF-GND-0", 500, 3.5, False, 400_000, 0.70, 0.80),   # ρ≈0.229; τ≈0.23 ms
-    ("AMF-GND-1", 300, 3.5, False, 400_000, 0.82, 0.90),   # ρ≈0.381
-    ("AMF-GND-2", 150, 3.5, False, 400_000, 0.93, 1.00),   # ρ≈0.762
+    # mid-load E[W]: GND-0≈0.26ms, GND-1≈0.53ms  →  τ_max=0.5ms splits them
+    ("AMF-GND-0", 500, 3.5, False, 400_000, 0.70, 0.80, 0.5),
+    ("AMF-GND-1", 300, 3.5, False, 400_000, 0.82, 0.90, 0.5),
+    ("AMF-GND-2", 150, 3.5, False, 400_000, 0.93, 1.00, 0.5),
 ]
 _ON_SMF_SPECS = [
-    ("SMF-ON-0",  800, 1.5, True,  500_000, 0.82, 1.00),   # ρ≈0.417; τ≈0.42 ms
-    ("SMF-ON-1",  600, 1.5, True,  500_000, 0.97, 1.00),   # ρ≈0.556
-    ("SMF-ON-2",  400, 1.5, True,  500_000, 1.08, 1.00),   # ρ≈0.833
+    # mid-load E[W]: ON-0≈0.63ms, ON-1≈1.10ms  →  τ_max=1.0ms borderlines ON-1
+    ("SMF-ON-0",  800, 1.5, True,  500_000, 0.82, 1.00, 1.0),
+    ("SMF-ON-1",  600, 1.5, True,  500_000, 0.97, 1.00, 1.0),
+    ("SMF-ON-2",  400, 1.5, True,  500_000, 1.08, 1.00, 1.0),   # ρ>1 → unstable
 ]
 _GND_SMF_SPECS = [
-    ("SMF-GND-0", 800, 3.5, False, 500_000, 0.72, 0.82),   # ρ≈0.179; τ≈0.18 ms
-    ("SMF-GND-1", 500, 3.5, False, 500_000, 0.85, 0.92),   # ρ≈0.286
-    ("SMF-GND-2", 300, 3.5, False, 500_000, 0.96, 1.00),   # ρ≈0.476
+    # mid-load E[W]: GND-0≈0.20ms, GND-1≈0.36ms  →  τ_max=0.3ms between them
+    ("SMF-GND-0", 800, 3.5, False, 500_000, 0.72, 0.82, 0.3),
+    ("SMF-GND-1", 500, 3.5, False, 500_000, 0.85, 0.92, 0.3),
+    ("SMF-GND-2", 300, 3.5, False, 500_000, 0.96, 1.00, 0.3),
 ]
+# UPF ρ is task-type dependent (CPR and N both vary).  Stability per task:
+#   gaming(N=400):    ON-0 ρ≈0.174  ON-1 ρ≈0.261  ON-2 ρ≈0.418  (all stable)
+#   youtube(N=700):   ON-0 ρ≈0.544  ON-1 ρ≈0.817  ON-2 ρ≈1.307  (ON-2 UNSTABLE)
+#   browsing(N=900):  ON-0 ρ≈0.550  ON-1 ρ≈0.825  ON-2 ρ≈1.320  (ON-2 UNSTABLE)
+#   instagram(N=1000):ON-0 ρ≈0.889  ON-1 ρ≈1.333  ON-2 ρ≈2.133  (ON-1,2 UNSTABLE)
+#   mixed(N=800):     ON-0 ρ≈0.533  ON-1 ρ≈0.800  ON-2 ρ≈1.280  (ON-2 UNSTABLE)
+# τ_max=2.0ms: gaming/browsing ON-0 well below → positive; instagram ON-0 E[W]≈5.8ms
+# >> τ_max → large negative x → LayerScheduler avoids onboard UPF for instagram.
 _ON_UPF_SPECS = [
-    ("UPF-ON-0",  1200, 1.5, True,  None, 0.75, 0.90),
-    ("UPF-ON-1",   800, 1.5, True,  None, 0.90, 1.00),
-    ("UPF-ON-2",   500, 1.5, True,  None, 1.00, 1.00),
+    ("UPF-ON-0",  1200, 1.5, True,  None, 0.75, 0.90, 2.0),
+    ("UPF-ON-1",   800, 1.5, True,  None, 0.90, 1.00, 2.0),
+    ("UPF-ON-2",   500, 1.5, True,  None, 1.00, 1.00, 2.0),
 ]
+# GND UPF: all stable for all task types (N=400–1000, all ρ < 0.58)
+# τ_max=0.4ms: GND-0 E[W]≈0.13ms < τ (safe); GND-1≈0.40ms borderline; GND-2≈1.2ms > τ
 _GND_UPF_SPECS = [
-    ("UPF-GND-0", 2000, 3.5, False, None, 0.65, 0.75),
-    ("UPF-GND-1", 1200, 3.5, False, None, 0.78, 0.88),
-    ("UPF-GND-2",  800, 3.5, False, None, 0.88, 0.97),
+    ("UPF-GND-0", 2000, 3.5, False, None, 0.65, 0.75, 0.4),
+    ("UPF-GND-1", 1200, 3.5, False, None, 0.78, 0.88, 0.4),
+    ("UPF-GND-2",  800, 3.5, False, None, 0.88, 0.97, 0.4),
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -141,13 +196,28 @@ def tn_bg_load(ho_id: int) -> float:
 class AccessNode:
     """
     Models one access node (trgSAT or TN) for Xn handover setup cost.
-    xn_setup_ms = xn_base_ms / (1 − bg_load)  — stretches under load.
-    total_access_cost_ms includes propagation + NGAP + Xn setup.
+
+    total_access_cost = prop_ms + xn_setup_ms
+      prop_ms     — orbital propagation delay (real Skyfield geometry)
+      xn_setup_ms = xn_base_ms / (1 − bg_load)  — load-stretched queuing approx.
+                    as bg_load → 1.0, setup time blows up (congestion collapse).
+
+    NGAP signaling is excluded: in NTN the NG-AP exchange is dominated by
+    propagation and Xn setup; the fixed NGAP constant adds no information to
+    the PathScheduler's gradient signal.
+
+    xn_base_ms reflects the baseline Xn preparation latency for each node type:
+      TrgSAT (ISL): lower base (direct satellite-to-satellite Xn, lightweight protocol)
+      TN     (GND): higher base (ground Xn involves more core-network signaling hops)
+
+    The tradeoff is load-driven: ISL wins when bg_load_trgsat is low; once
+    bg_load_trgsat crosses ~0.65, xn_setup_ISL exceeds xn_setup_GND and the
+    PathScheduler shifts traffic to the ground path.
     """
 
     def __init__(self, name: str, ngap_ms: float, xn_base_ms: float):
         self.name       = name
-        self.ngap_ms    = ngap_ms
+        self.ngap_ms    = ngap_ms    # kept for reference; excluded from cost signal
         self.xn_base_ms = xn_base_ms
         self.bg_load    = 0.30
 
@@ -155,19 +225,32 @@ class AccessNode:
         return self.xn_base_ms / max(1.0 - self.bg_load, 0.05)
 
     def total_access_cost_ms(self, prop_ms: float) -> float:
-        return prop_ms + self.ngap_ms + self.xn_setup_ms()
+        # NGAP excluded: prop + Xn setup only.
+        return prop_ms + self.xn_setup_ms()
+
+
+def _inverse_cost_split(cost_isl: float, cost_gnd: float) -> tuple[float, float]:
+    """
+    Instantaneous inverse-cost load-balancing split.
+    Returns (p_isl, p_gnd) proportional to 1/cost — the greedy optimum for
+    a static cost environment.  The PathScheduler's learned π_ISL/π_GND
+    converges to this split over time as it adapts to the time-varying bg_load.
+    Logged each HO so plots can show the convergence gap.
+    """
+    w_isl = 1.0 / max(cost_isl, 0.01)
+    w_gnd = 1.0 / max(cost_gnd, 0.01)
+    total = w_isl + w_gnd
+    return w_isl / total, w_gnd / total
 
 
 def compute_traffic_split(
     trgsat: AccessNode, tn: AccessNode, isl_ms: float, gnd_ms: float,
 ) -> tuple[float, float, float, float]:
-    """Inverse-cost split — kept as reference utility; not used by PathScheduler."""
+    """Full-form helper: computes access costs then inverse-cost split."""
     cost_isl = trgsat.total_access_cost_ms(isl_ms)
     cost_gnd = tn.total_access_cost_ms(gnd_ms)
-    w_isl    = 1.0 / max(cost_isl, 0.01)
-    w_gnd    = 1.0 / max(cost_gnd, 0.01)
-    total    = w_isl + w_gnd
-    return w_isl / total, w_gnd / total, cost_isl, cost_gnd
+    p_isl, p_gnd = _inverse_cost_split(cost_isl, cost_gnd)
+    return p_isl, p_gnd, cost_isl, cost_gnd
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -179,14 +262,19 @@ class PathScheduler:
     Bregman mirror descent over {ISL, GND} — one instance per task type.
 
     Mirrors the paper's Algorithm 1 at the access (path-selection) level:
-        x_{i',i}[t] = α (access_cost_i[t] − τ_access)
-        z            = max(x, −0.999)
-        grad_L(x)    = 1 / (1 + z)      [gradient of log(1+z)]
-        log_w[chosen] += η_path · min(grad_L, GRAD_CAP)
-        log_w         -= log_w.max()    (re-centre to prevent overflow)
+        For EACH path i' ∈ {ISL, GND} every round (full-information update):
+            x_{i',i}[t] = α (access_cost_{i'}[t] − τ_access)
+            z            = max(x, −0.999)
+            grad_L(x)    = 1 / (1 + z)      [gradient of log(1+z)]
+            log_w[i']   += η_path · min(grad_L, GRAD_CAP)
+        log_w -= log_w.max()    (re-centre to prevent overflow)
+
+    Both access costs are observable every round (satellite geometry gives both
+    isl_ms and gnd_ms regardless of which path is dispatched), so the full-
+    information Bregman update is used — not bandit/one-sided feedback.
 
     Lower access cost → more negative x → larger gradient → higher weight:
-    the scheduler naturally concentrates probability on the cheaper path.
+    the scheduler converges to the cheaper path without positive-feedback collapse.
     """
 
     def __init__(self) -> None:
@@ -209,14 +297,14 @@ class PathScheduler:
         self.p_gnd = float(p[1])
         return "ISL" if np.random.random() < self.p_isl else "GND"
 
-    def update(self, chosen: str, access_cost_ms: float) -> None:
-        """Update after observing the chosen path's access cost."""
-        idx  = 0 if chosen == "ISL" else 1
-        x    = ALPHA * (access_cost_ms - TAU_ACCESS)
-        z    = max(x, -0.999)
-        grad = min(1.0 / (1.0 + z), GRAD_CAP)
-        self.log_w[idx] += ETA_PATH * grad
-        self.log_w      -= self.log_w.max()
+    def update(self, access_cost_isl: float, access_cost_gnd: float) -> None:
+        """Full-information update: both paths' access costs are observed every round."""
+        for idx, cost in [(0, access_cost_isl), (1, access_cost_gnd)]:
+            x    = ALPHA * (cost - TAU_ACCESS)
+            z    = max(x, -0.999)
+            grad = min(1.0 / (1.0 + z), GRAD_CAP)
+            self.log_w[idx] += ETA_PATH * grad
+        self.log_w -= self.log_w.max()
 
     def status(self) -> str:
         return f"π_ISL={self.p_isl:.3f}  π_GND={self.p_gnd:.3f}"
@@ -236,19 +324,21 @@ class CoreInstance:
         ρ ≥ 0.95    → unstable → sojourn = 999 ms
 
     G/G/1 Kingman:
-        W_q = ρ/(1−ρ) · (ca²+cs²)/2 · τ
-        W   = W_q + Gamma(1/cs², τ·cs²)
+        W_q = ρ/(1−ρ) · (ca²+cs²)/2 · τ          (mean queueing wait)
+        W   = E[W_q] + Gamma(1/cs², τ·cs²)        (mean wait + stochastic service sample)
     """
 
     def __init__(
         self, name: str, millicores: int, cpu_freq_ghz: float,
         is_onboard: bool, fixed_cpr: int | None, cs: float, ca: float,
+        tau_max: float = 2.0,
     ):
         self.name        = name
         self.is_onboard  = is_onboard
         self.fixed_cpr   = fixed_cpr
         self.cs          = cs
         self.ca          = ca
+        self.tau_max     = tau_max   # per-instance sojourn threshold (ms)
         self.capacity_hz = (millicores / 1000.0) * cpu_freq_ghz * 1e9
         self.rho    = 0.0
         self.tau_ms = 1.0
@@ -279,7 +369,7 @@ class CoreInstance:
         return 999.0 if not self.is_stable() else self._q_mean_ms() + self.tau_ms
 
     def x_signal(self, w_ms: float) -> float:
-        return ALPHA * (w_ms - TAU_MAX)
+        return ALPHA * (w_ms - self.tau_max)
 
     def _z(self, x: float) -> float:
         return max(self.B * x, -0.999)
@@ -288,7 +378,9 @@ class CoreInstance:
         return math.log1p(self._z(x))
 
     def grad_L(self, x: float) -> float:
-        return 1.0 / (1.0 + self._z(x))
+        # ∂/∂x log(1 + B·x) = B/(1 + B·x)  — B must appear in the numerator.
+        # _z already clamps B·x to (-0.999, ∞), so the denominator is always >0.
+        return self.B / (1.0 + self._z(x))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -336,8 +428,14 @@ class LayerScheduler:
             self.weights[i] *= math.exp(exp)
         self.weights = np.clip(self.weights, 1e-12, None)
         self.weights /= self.weights.sum()
-        self.weights  = np.clip(self.weights, PROB_FLOOR / self.n, 1.0)
-        self.weights /= self.weights.sum()
+        # Apply floor then re-normalise until the floor holds (converges in 1–2 passes).
+        floor = PROB_FLOOR / self.n
+        for _ in range(2):
+            below = self.weights < floor
+            if not below.any():
+                break
+            self.weights[below] = floor
+            self.weights /= self.weights.sum()
 
         chosen = self.instances[idx]
         x_val  = x_all[idx]
@@ -353,6 +451,7 @@ _CSV_HEADER = [
     "isl_ms", "gnd_ms", "prop_ms",
     "path_p_isl", "path_p_gnd",
     "access_cost_isl", "access_cost_gnd",
+    "inv_cost_p_isl", "inv_cost_p_gnd",
     "trgsat_bg", "tn_bg",
     "amf_inst", "amf_p0", "amf_p1", "amf_p2",
     "amf_ms", "amf_rho", "amf_x", "amf_cost",
@@ -388,10 +487,15 @@ class Dispatcher:
     def __init__(self, log_dir: str | Path = "."):
         self.on_amf  = LayerScheduler([CoreInstance(*p) for p in _ON_AMF_SPECS])
         self.on_smf  = LayerScheduler([CoreInstance(*p) for p in _ON_SMF_SPECS])
-        self.on_upf  = LayerScheduler([CoreInstance(*p) for p in _ON_UPF_SPECS])
         self.gnd_amf = LayerScheduler([CoreInstance(*p) for p in _GND_AMF_SPECS])
         self.gnd_smf = LayerScheduler([CoreInstance(*p) for p in _GND_SMF_SPECS])
-        self.gnd_upf = LayerScheduler([CoreInstance(*p) for p in _GND_UPF_SPECS])
+        # Per-task UPF schedulers: each task type has its own learned weights so
+        # gaming's low-CPR weights do not contaminate instagram's high-CPR regime.
+        # AMF/SMF are shared because their CPR is task-independent (fixed_cpr).
+        self.on_upf  = {tt: LayerScheduler([CoreInstance(*p) for p in _ON_UPF_SPECS])
+                        for tt in TASK_TYPES}
+        self.gnd_upf = {tt: LayerScheduler([CoreInstance(*p) for p in _GND_UPF_SPECS])
+                        for tt in TASK_TYPES}
 
         self.ho_id             = 0
         self.cum_access_regret = 0.0
@@ -410,27 +514,37 @@ class Dispatcher:
             self._files.append(fh)
             self._writers[key] = wr
 
+        n_range       = f"{min(TASK_N_TASKS.values())}–{max(TASK_N_TASKS.values())}"
+        all_instances = (
+            self.on_amf.instances + self.gnd_amf.instances +
+            self.on_smf.instances + self.gnd_smf.instances +
+            next(iter(self.on_upf.values())).instances +
+            next(iter(self.gnd_upf.values())).instances
+        )
+        tau_vals  = [inst.tau_max for inst in all_instances]
+        tau_range = f"{min(tau_vals):.1f}–{max(tau_vals):.1f}"
         print(f"[Dispatcher] Two-level Bregman  "
               f"η_path={ETA_PATH}  η_x={ETA_X}  "
-              f"τ_max={TAU_MAX} ms  τ_access={TAU_ACCESS} ms  N={N_TASKS} tasks")
+              f"τ_max={tau_range} ms (per-instance)  τ_access={TAU_ACCESS} ms  N={n_range} tasks")
 
     def _configure_all(self, task_type: str) -> None:
+        n       = TASK_N_TASKS[task_type]
         upf_cpr = TASK_TYPES[task_type]
         for inst in self.on_amf.instances + self.gnd_amf.instances:
-            inst.configure(AMF_CYCLES, N_TASKS)
+            inst.configure(AMF_CYCLES, n)
         for inst in self.on_smf.instances + self.gnd_smf.instances:
-            inst.configure(SMF_CYCLES, N_TASKS)
-        for inst in self.on_upf.instances + self.gnd_upf.instances:
-            inst.configure(upf_cpr, N_TASKS)
+            inst.configure(SMF_CYCLES, n)
+        for inst in self.on_upf[task_type].instances + self.gnd_upf[task_type].instances:
+            inst.configure(upf_cpr, n)
 
-    def _best_compute_ms(self, path: str) -> float:
+    def _best_compute_ms(self, path: str, task_type: str) -> float:
         """Best stable AMF+SMF+UPF compute on the given path (no access overhead)."""
         def best(sched: LayerScheduler) -> float:
             stable = [inst for inst in sched.instances if inst.is_stable()]
             return min(inst.expected_delay_ms() for inst in stable) if stable else 999.0
         if path == "ISL":
-            return best(self.on_amf) + best(self.on_smf) + best(self.on_upf)
-        return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf)
+            return best(self.on_amf) + best(self.on_smf) + best(self.on_upf[task_type])
+        return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf[task_type])
 
     def dispatch(
         self,
@@ -454,11 +568,11 @@ class Dispatcher:
         if path == "ISL":
             amf_r = self.on_amf.select_and_process()
             smf_r = self.on_smf.select_and_process()
-            upf_r = self.on_upf.select_and_process()
+            upf_r = self.on_upf[task_type].select_and_process()
         else:
             amf_r = self.gnd_amf.select_and_process()
             smf_r = self.gnd_smf.select_and_process()
-            upf_r = self.gnd_upf.select_and_process()
+            upf_r = self.gnd_upf[task_type].select_and_process()
 
         amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = amf_r
         smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = smf_r
@@ -468,15 +582,15 @@ class Dispatcher:
         total_ms = access_cost + core_ms   # full end-to-end HO latency
 
         # ── Regret decomposition ──────────────────────────────────────────────
-        inst_oracle_ms   = self._best_compute_ms(path)
+        inst_oracle_ms   = self._best_compute_ms(path, task_type)
         inst_regret_ms   = max(0.0, core_ms - inst_oracle_ms)
 
         access_oracle_ms = min(access_cost_isl, access_cost_gnd)
         access_regret_ms = max(0.0, access_cost - access_oracle_ms)
 
         global_oracle_ms = min(
-            access_cost_isl + self._best_compute_ms("ISL"),
-            access_cost_gnd + self._best_compute_ms("GND"),
+            access_cost_isl + self._best_compute_ms("ISL", task_type),
+            access_cost_gnd + self._best_compute_ms("GND", task_type),
         )
         global_regret_ms = max(0.0, total_ms - global_oracle_ms)
 
@@ -486,10 +600,14 @@ class Dispatcher:
 
         on_ap  = self.on_amf.probabilities()
         on_sp  = self.on_smf.probabilities()
-        on_up  = self.on_upf.probabilities()
+        on_up  = self.on_upf[task_type].probabilities()
         gnd_ap = self.gnd_amf.probabilities()
         gnd_sp = self.gnd_smf.probabilities()
-        gnd_up = self.gnd_upf.probabilities()
+        gnd_up = self.gnd_upf[task_type].probabilities()
+
+        # Instantaneous inverse-cost split: greedy load-balanced optimum each round.
+        # PathScheduler's learned π_ISL/π_GND should converge toward this over time.
+        ic_p_isl, ic_p_gnd = _inverse_cost_split(access_cost_isl, access_cost_gnd)
 
         row = {
             "ho_id":           self.ho_id,
@@ -503,6 +621,8 @@ class Dispatcher:
             "path_p_gnd":      round(path_p_gnd, 4),
             "access_cost_isl": round(access_cost_isl, 3),
             "access_cost_gnd": round(access_cost_gnd, 3),
+            "inv_cost_p_isl":  round(ic_p_isl, 4),
+            "inv_cost_p_gnd":  round(ic_p_gnd, 4),
             "trgsat_bg":       round(trgsat_bg, 4),
             "tn_bg":           round(tn_bg, 4),
             "amf_inst": amf_idx,
@@ -590,13 +710,14 @@ class RandomDispatcher:
               f"→ {log_dir}/random_log.csv")
 
     def _configure_all(self, task_type: str) -> None:
+        n       = TASK_N_TASKS[task_type]
         upf_cpr = TASK_TYPES[task_type]
         for inst in self.on_amf.instances + self.gnd_amf.instances:
-            inst.configure(AMF_CYCLES, N_TASKS)
+            inst.configure(AMF_CYCLES, n)
         for inst in self.on_smf.instances + self.gnd_smf.instances:
-            inst.configure(SMF_CYCLES, N_TASKS)
+            inst.configure(SMF_CYCLES, n)
         for inst in self.on_upf.instances + self.gnd_upf.instances:
-            inst.configure(upf_cpr, N_TASKS)
+            inst.configure(upf_cpr, n)
 
     def _random_pick(self, sched: LayerScheduler) -> tuple[int, list[float], float, float, float, float]:
         stable = [i for i, inst in enumerate(sched.instances) if inst.is_stable()]
@@ -662,6 +783,8 @@ class RandomDispatcher:
         self.cum_inst_regret   += inst_regret_ms
         self.cum_global_regret += global_regret_ms
 
+        ic_p_isl, ic_p_gnd = _inverse_cost_split(access_cost_isl, access_cost_gnd)
+
         row = {
             "ho_id":           self.ho_id,
             "timestamp":       datetime.now(tz=timezone.utc).isoformat(),
@@ -674,6 +797,8 @@ class RandomDispatcher:
             "path_p_gnd":      0.5,
             "access_cost_isl": round(access_cost_isl, 3),
             "access_cost_gnd": round(access_cost_gnd, 3),
+            "inv_cost_p_isl":  round(ic_p_isl, 4),
+            "inv_cost_p_gnd":  round(ic_p_gnd, 4),
             "trgsat_bg":       round(trgsat_bg, 4),
             "tn_bg":           round(tn_bg, 4),
             "amf_inst": amf_idx,
