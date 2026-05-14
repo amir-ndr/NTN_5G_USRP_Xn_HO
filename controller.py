@@ -88,6 +88,13 @@ UE_ALT_M   =  10.0
 # HO trigger: srcSat elevation as seen from UE drops below this angle
 HO_ELEVATION_THRESHOLD_DEG = 25.0
 
+# Hard cap on total HOs. Set just below the point where TLE epoch overflow
+# starts producing SGP4 garbage (≈300 HOs at scale=1080× with a ~7-day-old TLE).
+# Algorithm convergence saturates around HO 150–200, so 280 captures the full
+# learning curve with margin and stops cleanly before bad geometry contaminates
+# downstream plots / USRP latency.
+HO_HARD_CAP = 280
+
 # After HO fires, wait for srcSat to rise above this before re-arming
 # (only relevant in real-time mode; accelerated mode uses a timer reset).
 HO_RESET_ELEVATION_DEG = 0.0
@@ -137,6 +144,69 @@ TASK_MARKOV: dict[str, list[float]] = {
     "mixed":      [0.20,   0.20,    0.20,     0.20,     0.20],   # truly uniform
 }
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── τ_max profiles (operator threshold calibration) ──────────────────────────
+# 3GPP defines per-stage timeout thresholds; operators choose actual values.
+# The gradient signal is  x = α(E[W] − τ_max)  per instance, so τ_max calibrates
+# the algorithm's view of "fast" vs "slow":
+#   x < 0  → instance favoured (grad large positive, weight grows fast)
+#   x > 0  → instance penalised (grad small, weight grows slowly)
+# At default values, x crosses zero around the median instance in each layer →
+# clean differentiation.
+#
+# Three profiles for A/B testing on USRP. Run each, save dispatch_log.csv with
+# a profile-tagged name, then compare convergence behaviour:
+#
+#   strict   τ_max ≈ ½ default  → x mostly POSITIVE → grad small
+#                               → slow weight growth, weaker differentiation
+#   default  current calibrated → x straddles zero  → fastest, cleanest convergence
+#   relaxed  τ_max ≈ 3× default → x mostly NEGATIVE → grad SATURATES at GRAD_CAP
+#                               → all instances look equally "fast" → muted gap
+#
+# All six per-instance τ_max values AND the path-level TAU_ACCESS switch together
+# so the comparison is consistent across layers.
+TAU_PROFILES: dict[str, dict[str, float]] = {
+    "strict": {
+        "TAU_ACCESS": 25.0,
+        "ON_AMF":  0.70, "ON_SMF":  0.50, "ON_UPF":  1.00,
+        "GND_AMF": 0.25, "GND_SMF": 0.15, "GND_UPF": 0.20,
+    },
+    "default": {
+        "TAU_ACCESS": 25.0,
+        "ON_AMF":  1.50, "ON_SMF":  1.00, "ON_UPF":  2.00,
+        "GND_AMF": 0.50, "GND_SMF": 0.30, "GND_UPF": 0.40,
+    },
+    "relaxed": {
+        "TAU_ACCESS": 25.0,
+        "ON_AMF":  4.00, "ON_SMF":  3.00, "ON_UPF":  6.00,
+        "GND_AMF": 1.50, "GND_SMF": 1.00, "GND_UPF": 1.50,
+    },
+}
+
+
+def _apply_tau_profile(profile_name: str) -> None:
+    """Patch dispatcher's per-instance τ_max + TAU_ACCESS at runtime.
+    Must be called BEFORE Dispatcher() / RandomDispatcher() are constructed."""
+    import dispatcher as d
+    p = TAU_PROFILES[profile_name]
+
+    d.TAU_ACCESS = p["TAU_ACCESS"]
+
+    # τ_max is at index 7 of every spec tuple (same position in AMF/SMF/UPF specs).
+    def _patch(specs: list[tuple], key: str) -> list[tuple]:
+        return [s[:7] + (p[key],) + s[8:] for s in specs]
+
+    d._ON_AMF_SPECS  = _patch(d._ON_AMF_SPECS,  "ON_AMF")
+    d._ON_SMF_SPECS  = _patch(d._ON_SMF_SPECS,  "ON_SMF")
+    d._ON_UPF_SPECS  = _patch(d._ON_UPF_SPECS,  "ON_UPF")
+    d._GND_AMF_SPECS = _patch(d._GND_AMF_SPECS, "GND_AMF")
+    d._GND_SMF_SPECS = _patch(d._GND_SMF_SPECS, "GND_SMF")
+    d._GND_UPF_SPECS = _patch(d._GND_UPF_SPECS, "GND_UPF")
+
+    print(f"\n[Controller] τ_max profile: '{profile_name}'")
+    print(f"  TAU_ACCESS = {p['TAU_ACCESS']:.1f} ms")
+    print(f"  ON  AMF={p['ON_AMF']:.2f}  SMF={p['ON_SMF']:.2f}  UPF={p['ON_UPF']:.2f}  (ms)")
+    print(f"  GND AMF={p['GND_AMF']:.2f}  SMF={p['GND_SMF']:.2f}  UPF={p['GND_UPF']:.2f}  (ms)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -370,8 +440,12 @@ def _trigger_handover(
         tn_bg           = tn_node.bg_load,
     )
 
-    # Full-information Bregman update: both access costs observed every round
-    sched.update(cost_isl, cost_gnd)
+    # Full-information Bregman update: total cost (access + best reachable compute)
+    # PathScheduler must see compute cost so it learns task-specific path preferences.
+    # e.g. instagram: all ON-UPF unstable → ISL total >> GND total → correct GND bias.
+    exp_isl = dispatcher.expected_compute_ms("ISL", task_type)
+    exp_gnd = dispatcher.expected_compute_ms("GND", task_type)
+    sched.update(cost_isl + exp_isl, cost_gnd + exp_gnd)
 
     # ── Random baseline: 50/50 path + uniform NF (independent of Bregman) ────
     if rand_dispatcher is not None:
@@ -406,9 +480,11 @@ def _trigger_handover(
     print(f"  UE→tgtSat ({state.tgt_name}) elevation = {state.ue_tgt_elevation_deg:.1f}°")
     print(f"  Prop delay : ISL={isl_ms:.2f} ms  |  GND={gnd_ms:.2f} ms")
     print(f"  TrgSAT bg={trgsat_node.bg_load:.2f}  "
-          f"cost_ISL={cost_isl:.2f} ms  →  π_ISL[{task_type}]={sched.p_isl:.3f}")
+          f"total_ISL={cost_isl + exp_isl:.2f} ms (acc={cost_isl:.2f}+cmp={exp_isl:.2f})"
+          f"  →  π_ISL[{task_type}]={sched.p_isl:.3f}")
     print(f"  TN     bg={tn_node.bg_load:.2f}  "
-          f"cost_GND={cost_gnd:.2f} ms  →  π_GND[{task_type}]={sched.p_gnd:.3f}")
+          f"total_GND={cost_gnd + exp_gnd:.2f} ms (acc={cost_gnd:.2f}+cmp={exp_gnd:.2f})"
+          f"  →  π_GND[{task_type}]={sched.p_gnd:.3f}")
     print(f"  Path selected  : {path}")
     print(f"  Core delay : AMF={info['amf_ms']:.2f} ms  SMF={info['smf_ms']:.2f} ms  "
           f"UPF={info['upf_ms']:.2f} ms  →  total={info['total_ms']:.2f} ms")
@@ -464,6 +540,10 @@ def main():
     p.add_argument("--delay",        choices=["normal", "NE-ONE"], default="normal",
                    help="Delay mode: 'normal'=delays.json+receiver sleep (default), "
                         "'NE-ONE'=also push delays to NE-ONE emulator via REST API")
+    p.add_argument("--tau-profile",  choices=list(TAU_PROFILES.keys()), default="default",
+                   help="τ_max profile: strict | default | relaxed.  Controls how "
+                        "tightly the algorithm's gradient signal is calibrated against "
+                        "each NF instance's expected delay.  Useful for USRP A/B testing.")
     args = p.parse_args()
 
     if args.list_sats:
@@ -522,20 +602,26 @@ def main():
         engine.update_pair(src, tgt)
         print(f"[Controller] Scan complete in {elapsed:.1f}s")
 
-    dispatcher      = Dispatcher(log_dir=_HERE)
-    rand_dispatcher = RandomDispatcher(log_dir=_HERE)
+    # Apply τ_max profile BEFORE Dispatcher init (it reads dispatcher specs once).
+    _apply_tau_profile(args.tau_profile)
+
+    dispatcher      = Dispatcher(log_dir=_HERE, tag=args.tau_profile)
+    rand_dispatcher = RandomDispatcher(log_dir=_HERE, tag=args.tau_profile)
     # One PathScheduler per task type — each learns its own π_ISL / π_GND
     path_schedulers: dict[str, PathScheduler] = {tt: PathScheduler() for tt in TASK_CYCLE}
 
     # ── Access nodes (srcSAT decides path based on Xn setup cost) ────────────
-    # TrgSAT: onboard satellite node  — fast bg_load oscillation [0.20, 0.85], period 120 HOs
-    #   xn_base_ms=2.0: ISL Xn preparation is lightweight (direct sat-to-sat, no core hops)
-    # TN:     ground datacenter node  — slow bg_load oscillation [0.10, 0.60], period 300 HOs
-    #   xn_base_ms=5.0: GND Xn involves more core-network signaling (AMF, UPF anchoring)
+    # Physics-correct ordering: ISL single-hop is FASTER baseline than GND multi-hop.
+    # TrgSAT (ISL): xn_base=3.0 ms — single satellite-to-satellite hop, lightweight
+    #               Xn protocol.  bg_load ∈ [0.20, 0.85]: limited onboard capacity,
+    #               so M/M/1 sojourn 1/(1−ρ) inflates sharply near peak load.
+    # TN     (GND): xn_base=5.0 ms — multi-hop ground core signaling (gNB → AMF →
+    #               anchor UPF).  bg_load ∈ [0.10, 0.60]: elastic capacity, mild ρ.
     #
-    # Tradeoff: ISL wins when trgSAT bg_load < ~0.65 (cost_ISL < cost_GND);
-    #           once bg_load_ISL > 0.65, cost_ISL > cost_GND → PathScheduler shifts to GND.
-    trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=2.0)
+    # Crossover (access only): bg_isl ≈ 0.82 with mid bg_tn = 0.35 (top of the
+    # ISL bg cycle).  Compute pulls instagram's transition lower (≈0.70) because
+    # ISL compute is ~4 ms (UPF-ON-2 only) vs ~0.7 ms on GND.
+    trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=4.0)
     tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=5.0)
 
     ho_count      = 0            # total HOs fired
@@ -589,18 +675,47 @@ def main():
     timer_reset    = (scale > 1.0)
     reset_interval_s = args.ho_every if (timer_reset and args.ho_every) else None
 
+    # ── delays.json sanity guard ──────────────────────────────────────────────
+    # LEO geometry caps the physically possible values; anything above means
+    # SGP4 has returned garbage (stale TLE / epoch overflow). When a tick is
+    # out of bounds we re-use the last valid pair so delays.json never
+    # contains nonsense values that would cause trgSAT/TN to sleep for seconds.
+    _DELAY_MAX_ISL_MS = 100.0   # LEO sat-to-sat ≤ ~57 ms (17 000 km)
+    _DELAY_MAX_GND_MS =  50.0   # LEO sat-to-ground ≤ ~3.7 ms at zenith, ≤ ~20 ms at horizon
+    last_valid_isl_ms = None
+    last_valid_gnd_ms = None
+    bad_tick_warned   = False
+
     while running:
         loop_start = time.monotonic()
         now_real   = time.monotonic()
 
         state = engine.state(unix_time=sim_time)
+
+        isl_for_write = state.isl_delay_ms
+        gnd_for_write = state.sat_gnd_delay_ms
+        if isl_for_write > _DELAY_MAX_ISL_MS or gnd_for_write > _DELAY_MAX_GND_MS:
+            # SGP4 garbage — fall back to last valid pair (if any).
+            if last_valid_isl_ms is not None:
+                isl_for_write = last_valid_isl_ms
+                gnd_for_write = last_valid_gnd_ms
+            if not bad_tick_warned:
+                print(f"  [WARN] SGP4 out of bounds  ISL={state.isl_delay_ms:.0f}ms  "
+                      f"GND={state.sat_gnd_delay_ms:.0f}ms  → using last valid values. "
+                      f"Refresh starlink.tle or restart simulation.", flush=True)
+                bad_tick_warned = True
+        else:
+            last_valid_isl_ms = isl_for_write
+            last_valid_gnd_ms = gnd_for_write
+            bad_tick_warned   = False
+
         _write_delays(
-            state.isl_delay_ms, state.sat_gnd_delay_ms,
+            isl_for_write, gnd_for_write,
             state.src_name, state.tgt_name, state.ue_tgt_elevation_deg,
             task_type=task_type,
         )
         if neone is not None:
-            neone.set_both(state.isl_delay_ms, state.sat_gnd_delay_ms)
+            neone.set_both(isl_for_write, gnd_for_write)
 
         src_el  = state.ue_src_elevation_deg
         ho_flag = ""
@@ -623,6 +738,19 @@ def main():
             tn_node.bg_load     = tn_bg_load(ho_count)
             ho_count       += 1
             task_ho_count  += 1
+
+            # ── Hard cap: stop cleanly before TLE epoch overflow corrupts data ──
+            if ho_count >= HO_HARD_CAP:
+                print(f"\n{'='*80}")
+                print(f"  [HO HARD CAP REACHED]  {ho_count} handovers completed.")
+                print(f"  Algorithm has fully converged (saturates around HO ~150-200).")
+                print(f"  Stopping cleanly before SGP4 garbage from stale TLE epoch.")
+                print(f"  Refresh starlink.tle to extend the simulation window.")
+                print(f"{'='*80}\n", flush=True)
+                running = False
+                dispatcher.close()
+                rand_dispatcher.close()
+                break
 
             # Markov task switching: after MIN_TASK_HOS HOs sample the next task.
             # Self-transitions keep the current type; the minimum block of

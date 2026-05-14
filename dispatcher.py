@@ -89,25 +89,36 @@ TASK_N_TASKS: dict[str, int] = {
     "mixed":     800,   # average of above
 }
 
-TAU_ACCESS   = 12.0   # access-cost threshold (ms) — Level-1 PathScheduler: x = α(c−τ_a)
+TAU_ACCESS   = 32.0   # total-cost threshold (ms) — Level-1 PathScheduler: x = α(c−τ_a)
+# Calibration: median total cost across both paths is ~30–35 ms.
+#   ISL total = access(26–64) + compute(3–8)  =  29–72 ms
+#   GND total = access(33–39) + compute(1–2)  =  34–41 ms
+# Setting τ_access in the middle gives informative gradients on both sides:
+#   x < 0 → grad = 1/(1+x) is LARGE (positive), instance favoured
+#   x > 0 → grad shrinks toward 0, instance suppressed
 # Per-instance τ_max is now embedded in each CoreInstance spec tuple (8th element).
 # Rationale: TN (GND) instances run on high-clock server CPUs → stricter deadlines;
 # NTN (ON) instances run on power-limited onboard CPUs → relaxed deadlines.
 # Values chosen so each instance's expected delay sits near its τ_max at mid-load,
 # giving the LayerScheduler gradient differentiation across load regimes.
 ALPHA        = 0.1    # cost-signal scaling for both levels:  x = α(w − τ)
-ETA_X        = 0.05   # Level-2 (NF compute) Bregman step
+ETA_X        = 0.05   # Level-2 exploration step (NF instance weight update)
+ETA_B        = 0.02   # Level-2 exploitation step (service-rate B_j update)
 ETA_PATH     = 0.2    # Level-1 (path) Bregman step — positive multiplicative weights
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
 PROB_FLOOR   = 0.05   # minimum probability per NF instance (exploration floor)
+B_MULT_MIN   = 0.5    # minimum B_mult (50% of hardware baseline)
+B_MULT_MAX   = 2.0    # maximum B_mult (200% of hardware baseline)
 
-# ── Task types: UPF cycles per request ───────────────────────────────────────
+# ── Task types: UPF CPR fallback (used only if instance has no task_cpr dict) ──
+# With per-instance task_cpr, these values are superseded for UPF instances.
+# They remain authoritative for any future UPF instance added without a task_cpr dict.
 TASK_TYPES: dict[str, int] = {
-    "gaming":    783_333,    # UPF-ON-0 ρ≈0.435 E[W]≈0.67ms; GND-0 ρ≈0.112
-    "youtube":   1_400_000,  # UPF-ON-0 ρ≈0.778 E[W]≈2.65ms; GND-0 ρ≈0.200
-    "browsing":  1_100_000,  # UPF-ON-0 ρ≈0.611 E[W]≈1.27ms; GND-0 ρ≈0.157
-    "instagram": 1_600_000,  # UPF-ON-0 ρ≈0.889 E[W]≈5.77ms (>τ_max); GND-0 ρ≈0.229
-    "mixed":     1_200_000,  # UPF-ON-0 ρ≈0.667 E[W]≈1.58ms; GND-0 ρ≈0.171
+    "gaming":    783_333,
+    "youtube":   1_400_000,
+    "browsing":  1_100_000,
+    "instagram": 1_600_000,
+    "mixed":     1_200_000,
 }
 TASK_CYCLE = ["gaming", "youtube", "browsing", "instagram", "mixed"]
 
@@ -126,67 +137,148 @@ SMF_CYCLES = 500_000    # PDU session establishment: ~5×10^5 cycles
 #  across the full load range (not clamped to the boundary on either extreme).
 # ══════════════════════════════════════════════════════════════════════════════
 
+#  Capacity design rule: every instance must be STABLE (ρ < 0.95) for every task
+#  even at peak bg-load oscillation, so the LayerScheduler has 3 live choices.
+#  Then ranking comes from: (1) raw τ (faster instance = lower base delay),
+#  (2) per-instance background load profile (creates non-stationary crossings),
+#  (3) variability cs/ca (Kingman variance term differentiates instances).
+#  ON cs/ca higher than GND → satellite NF stack more bursty than data-centre.
+
 _ON_AMF_SPECS = [
-    # mid-load E[W]: ON-0≈0.94ms, ON-1≈2.27ms  →  τ_max=1.5ms splits them cleanly
-    ("AMF-ON-0",  500, 1.5, True,  400_000, 0.80, 1.00, 1.5),
-    ("AMF-ON-1",  350, 1.5, True,  400_000, 0.90, 1.00, 1.5),
-    ("AMF-ON-2",  200, 1.5, True,  400_000, 1.05, 1.00, 1.5),   # ρ>1 → unstable
+    # cap(MHz): ON-0=1050  ON-1=750  ON-2=600  →  ρ_max(inst=1000, cpr=400k) = 0.38/0.53/0.67
+    # +bg amp (0.20/0.17/0.13) → peak ρ ≤ 0.80 for all   → always stable
+    ("AMF-ON-0",  700, 1.5, True,  400_000, 1.10, 1.20, 1.5),
+    ("AMF-ON-1",  500, 1.5, True,  400_000, 1.25, 1.20, 1.5),
+    ("AMF-ON-2",  400, 1.5, True,  400_000, 1.40, 1.20, 1.5),
 ]
 _GND_AMF_SPECS = [
-    # mid-load E[W]: GND-0≈0.26ms, GND-1≈0.53ms  →  τ_max=0.5ms splits them
-    ("AMF-GND-0", 500, 3.5, False, 400_000, 0.70, 0.80, 0.5),
-    ("AMF-GND-1", 300, 3.5, False, 400_000, 0.82, 0.90, 0.5),
-    ("AMF-GND-2", 150, 3.5, False, 400_000, 0.93, 1.00, 0.5),
+    # cap(MHz): GND-0=1750  GND-1=1225  GND-2=875  → ρ_max = 0.23/0.33/0.46
+    # +bg amp 0.10–0.15 → peak ρ ≤ 0.62  → always stable, low variance
+    ("AMF-GND-0", 500, 3.5, False, 400_000, 0.55, 0.70, 0.5),
+    ("AMF-GND-1", 350, 3.5, False, 400_000, 0.65, 0.75, 0.5),
+    ("AMF-GND-2", 250, 3.5, False, 400_000, 0.75, 0.80, 0.5),
 ]
 _ON_SMF_SPECS = [
-    # mid-load E[W]: ON-0≈0.63ms, ON-1≈1.10ms  →  τ_max=1.0ms borderlines ON-1
-    ("SMF-ON-0",  800, 1.5, True,  500_000, 0.82, 1.00, 1.0),
-    ("SMF-ON-1",  600, 1.5, True,  500_000, 0.97, 1.00, 1.0),
-    ("SMF-ON-2",  400, 1.5, True,  500_000, 1.08, 1.00, 1.0),   # ρ>1 → unstable
+    # cap(MHz): ON-0=1350  ON-1=1050  ON-2=825  → ρ_max(inst=1000, cpr=500k) = 0.37/0.48/0.61
+    # +bg amp 0.15–0.20 → peak ρ ≤ 0.81  → always stable
+    ("SMF-ON-0",  900, 1.5, True,  500_000, 1.05, 1.15, 1.0),
+    ("SMF-ON-1",  700, 1.5, True,  500_000, 1.20, 1.15, 1.0),
+    ("SMF-ON-2",  550, 1.5, True,  500_000, 1.35, 1.15, 1.0),
 ]
 _GND_SMF_SPECS = [
-    # mid-load E[W]: GND-0≈0.20ms, GND-1≈0.36ms  →  τ_max=0.3ms between them
-    ("SMF-GND-0", 800, 3.5, False, 500_000, 0.72, 0.82, 0.3),
-    ("SMF-GND-1", 500, 3.5, False, 500_000, 0.85, 0.92, 0.3),
-    ("SMF-GND-2", 300, 3.5, False, 500_000, 0.96, 1.00, 0.3),
+    # cap(MHz): GND-0=2800  GND-1=1750  GND-2=1225  → ρ_max = 0.18/0.29/0.41
+    # +bg amp 0.10–0.15 → peak ρ ≤ 0.56  → always stable
+    ("SMF-GND-0", 800, 3.5, False, 500_000, 0.55, 0.65, 0.3),
+    ("SMF-GND-1", 500, 3.5, False, 500_000, 0.65, 0.75, 0.3),
+    ("SMF-GND-2", 350, 3.5, False, 500_000, 0.75, 0.80, 0.3),
 ]
-# UPF ρ is task-type dependent (CPR and N both vary).  Stability per task:
-#   gaming(N=400):    ON-0 ρ≈0.174  ON-1 ρ≈0.261  ON-2 ρ≈0.418  (all stable)
-#   youtube(N=700):   ON-0 ρ≈0.544  ON-1 ρ≈0.817  ON-2 ρ≈1.307  (ON-2 UNSTABLE)
-#   browsing(N=900):  ON-0 ρ≈0.550  ON-1 ρ≈0.825  ON-2 ρ≈1.320  (ON-2 UNSTABLE)
-#   instagram(N=1000):ON-0 ρ≈0.889  ON-1 ρ≈1.333  ON-2 ρ≈2.133  (ON-1,2 UNSTABLE)
-#   mixed(N=800):     ON-0 ρ≈0.533  ON-1 ρ≈0.800  ON-2 ρ≈1.280  (ON-2 UNSTABLE)
-# τ_max=2.0ms: gaming/browsing ON-0 well below → positive; instagram ON-0 E[W]≈5.8ms
-# >> τ_max → large negative x → LayerScheduler avoids onboard UPF for instagram.
+# ── Per-instance UPF CPR matrix ───────────────────────────────────────────────
+# Each UPF instance has a different software implementation optimised for a
+# different traffic pattern.  CPR (cycles per request) varies per instance per
+# task type, causing relative ρ rankings to genuinely flip across task switches.
+#
+#   ON-0  (DPDK user-space, 1800 MHz): cheap small-packet (gaming/browsing) but
+#          expensive per-byte (instagram → ρ > 1 → UNSTABLE).
+#   ON-1  (kernel-space, 1350 MHz):    balanced; mid-CPR everywhere; unstable for
+#          instagram only.
+#   ON-2  (batch processor, 1350 MHz): expensive for tiny gaming packets but
+#          efficient for media — STAYS STABLE under instagram (the only ON UPF
+#          that does). LayerScheduler must learn to pick it specifically when
+#          task=instagram and path=ISL.
+#
+# ρ per task (cap: ON-0=1.8 GHz, ON-1=1.35 GHz, ON-2=1.35 GHz):
+#   gaming(N=400):    ON-0 ρ≈0.11  ON-1 ρ≈0.24  ON-2 ρ≈0.44   ON-0 best
+#   youtube(N=700):   ON-0 ρ≈0.39  ON-1 ρ≈0.57  ON-2 ρ≈0.42   ON-0 best
+#   browsing(N=900):  ON-0 ρ≈0.50  ON-1 ρ≈0.67  ON-2 ρ≈0.57   ON-0 best
+#   instagram(N=1000):ON-0 ρ≈1.11  ON-1 ρ≈1.19  ON-2 ρ≈0.67   ON-2 ONLY STABLE
+#   mixed(N=800):     ON-0 ρ≈0.53  ON-1 ρ≈0.65  ON-2 ρ≈0.53   ON-0 ≈ ON-2 (tie)
+_UPF_CPR_ON0  = {"gaming":  500_000,  "youtube": 1_000_000, "browsing": 1_000_000,
+                  "instagram": 2_000_000, "mixed": 1_200_000}
+_UPF_CPR_ON1  = {"gaming":  800_000,  "youtube": 1_100_000, "browsing": 1_000_000,
+                  "instagram": 1_600_000, "mixed": 1_100_000}
+_UPF_CPR_ON2  = {"gaming": 1_500_000, "youtube":   800_000, "browsing":   850_000,
+                  "instagram":  900_000, "mixed":     900_000}
+
+# GND UPF caps: GND-0=7.0 GHz, GND-1=4.2 GHz, GND-2=2.45 GHz. All stable everywhere
+# (max ρ ≤ 0.40), so they form a reliable fallback. GND-0 always fastest, but its
+# raw cost premium (server-class hw) is paid in higher access cost via PathScheduler.
+_UPF_CPR_GND0 = {"gaming":  400_000,  "youtube": 1_000_000, "browsing":   800_000,
+                  "instagram": 1_300_000, "mixed":   850_000}
+_UPF_CPR_GND1 = {"gaming":  600_000,  "youtube":   900_000, "browsing":   850_000,
+                  "instagram": 1_100_000, "mixed":   900_000}
+_UPF_CPR_GND2 = {"gaming":  900_000,  "youtube":   700_000, "browsing":   750_000,
+                  "instagram":   800_000, "mixed":   750_000}
+
+# cs/ca: ON instances have HIGHER variability (bursty satellite NF) than GND.
 _ON_UPF_SPECS = [
-    ("UPF-ON-0",  1200, 1.5, True,  None, 0.75, 0.90, 2.0),
-    ("UPF-ON-1",   800, 1.5, True,  None, 0.90, 1.00, 2.0),
-    ("UPF-ON-2",   500, 1.5, True,  None, 1.00, 1.00, 2.0),
+    ("UPF-ON-0",  1200, 1.5, True,  None, 1.05, 1.15, 2.0, _UPF_CPR_ON0),
+    ("UPF-ON-1",   900, 1.5, True,  None, 1.20, 1.15, 2.0, _UPF_CPR_ON1),
+    ("UPF-ON-2",   900, 1.5, True,  None, 1.35, 1.15, 2.0, _UPF_CPR_ON2),
 ]
-# GND UPF: all stable for all task types (N=400–1000, all ρ < 0.58)
-# τ_max=0.4ms: GND-0 E[W]≈0.13ms < τ (safe); GND-1≈0.40ms borderline; GND-2≈1.2ms > τ
 _GND_UPF_SPECS = [
-    ("UPF-GND-0", 2000, 3.5, False, None, 0.65, 0.75, 0.4),
-    ("UPF-GND-1", 1200, 3.5, False, None, 0.78, 0.88, 0.4),
-    ("UPF-GND-2",  800, 3.5, False, None, 0.88, 0.97, 0.4),
+    ("UPF-GND-0", 2000, 3.5, False, None, 0.55, 0.65, 0.4, _UPF_CPR_GND0),
+    ("UPF-GND-1", 1200, 3.5, False, None, 0.65, 0.75, 0.4, _UPF_CPR_GND1),
+    ("UPF-GND-2",  700, 3.5, False, None, 0.75, 0.80, 0.4, _UPF_CPR_GND2),
 ]
+
+# ── Per-instance background load (AMF and SMF only) ───────────────────────────
+# Each NF instance has its own independent oscillating background occupancy.
+# Different periods and phases create genuine crossing points where a smaller
+# instance is temporarily less loaded than a larger one — the ranking flips over
+# time, giving the LayerScheduler a non-trivial learning target.
+# Format: (amplitude, period_in_HOs, phase_offset_radians)
+#   ON  instances: faster oscillations (satellite NF workload bursts quickly)
+#   GND instances: slower, smaller oscillations (stable data-centre environment)
+INSTANCE_LOAD_PROFILES: dict[str, tuple[float, int, float]] = {
+    # Amplitudes tuned so that:
+    #   (a) peak ρ stays below 0.85 even at worst-case task load (stability margin)
+    #   (b) amplitude exceeds the base-ρ gap to neighbouring instance for crossings
+    # Adjacent base-ρ gaps under instagram (worst case):
+    #   AMF-ON: 0.38 → 0.53 → 0.67   gaps≈0.15        bg amp 0.20/0.17/0.13
+    #   SMF-ON: 0.37 → 0.48 → 0.61   gaps≈0.11–0.13   bg amp 0.20/0.17/0.13
+    #   GND   : smaller gaps, smaller amp (data-centre stability)
+    "AMF-ON-0":  (0.20, 40,  0.00),
+    "AMF-ON-1":  (0.17, 55,  0.35),
+    "AMF-ON-2":  (0.13, 70,  0.70),
+    "AMF-GND-0": (0.12, 90,  0.10),
+    "AMF-GND-1": (0.10, 120, 0.55),
+    "AMF-GND-2": (0.08, 80,  0.85),
+    "SMF-ON-0":  (0.20, 45,  0.20),
+    "SMF-ON-1":  (0.17, 60,  0.50),
+    "SMF-ON-2":  (0.13, 75,  0.80),
+    "SMF-GND-0": (0.12, 100, 0.15),
+    "SMF-GND-1": (0.10, 130, 0.60),
+    "SMF-GND-2": (0.08, 85,  0.90),
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Background load functions
-#  TrgSAT: fast oscillation [0.20, 0.85], period = 120 HOs
-#  TN:     slow oscillation [0.10, 0.60], period = 300 HOs
+#  TrgSAT: fast oscillation [TRGSAT_BG_TROUGH, TRGSAT_BG_PEAK], period = 120 HOs
+#  TN:     slow oscillation [TN_BG_TROUGH,     TN_BG_PEAK],     period = 300 HOs
+#
+#  TRGSAT_BG_PEAK is the satellite signaling-load peak — an OPERATING CONDITION,
+#  not a system parameter.  Higher peak means heavier concurrent UE signaling on
+#  the onboard Xn processor, which inflates the M/M/1 sojourn 1/(1-ρ) more
+#  aggressively.  Sweep this for paper figures demonstrating algorithm
+#  adaptivity under varying satellite stress.  Default 0.85 = peak traffic.
 # ══════════════════════════════════════════════════════════════════════════════
+
+TRGSAT_BG_TROUGH = 0.20
+TRGSAT_BG_PEAK   = 0.85    # ← OPERATING-CONDITION knob; bg_peak_sweep.py varies this
+TN_BG_TROUGH     = 0.10
+TN_BG_PEAK       = 0.60
+
 
 def trgsat_bg_load(ho_id: int) -> float:
     phase = (ho_id % 120) / 120.0
     level = 0.5 + 0.5 * math.sin(2.0 * math.pi * phase)
-    return 0.20 + (0.85 - 0.20) * level
+    return TRGSAT_BG_TROUGH + (TRGSAT_BG_PEAK - TRGSAT_BG_TROUGH) * level
 
 
 def tn_bg_load(ho_id: int) -> float:
     phase = (ho_id % 300) / 300.0
     level = 0.5 + 0.5 * math.sin(2.0 * math.pi * phase)
-    return 0.10 + (0.60 - 0.10) * level
+    return TN_BG_TROUGH + (TN_BG_PEAK - TN_BG_TROUGH) * level
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,21 +290,41 @@ class AccessNode:
     Models one access node (trgSAT or TN) for Xn handover setup cost.
 
     total_access_cost = prop_ms + xn_setup_ms
-      prop_ms     — orbital propagation delay (real Skyfield geometry)
-      xn_setup_ms = xn_base_ms / (1 − bg_load)  — load-stretched queuing approx.
-                    as bg_load → 1.0, setup time blows up (congestion collapse).
+      prop_ms     — orbital propagation delay (real Skyfield geometry).
+                    Typical: ISL ≈ 15–22 ms, GND ≈ 25–32 ms.
+      xn_setup_ms = xn_base_ms / (1 − bg_load)  — M/M/1 sojourn approximation.
 
-    NGAP signaling is excluded: in NTN the NG-AP exchange is dominated by
-    propagation and Xn setup; the fixed NGAP constant adds no information to
-    the PathScheduler's gradient signal.
+    PHASE TRANSITION DESIGN (Level-1 PathScheduler tradeoff)
+    ────────────────────────────────────────────────────────
+    The Xn term is the ONLY load-dependent component of access cost. To make the
+    PathScheduler genuinely face a tradeoff we want:
 
-    xn_base_ms reflects the baseline Xn preparation latency for each node type:
-      TrgSAT (ISL): lower base (direct satellite-to-satellite Xn, lightweight protocol)
-      TN     (GND): higher base (ground Xn involves more core-network signaling hops)
+      Low  bg_isl  → access(ISL) < access(GND)   (ISL wins; shorter prop, simpler Xn)
+      High bg_isl  → access(ISL) > access(GND)   (GND wins; ISL Xn queue blows up)
 
-    The tradeoff is load-driven: ISL wins when bg_load_trgsat is low; once
-    bg_load_trgsat crosses ~0.65, xn_setup_ISL exceeds xn_setup_GND and the
-    PathScheduler shifts traffic to the ground path.
+    Physics of xn_base_ms (baseline 1/μ — service time when queue is empty):
+      TrgSAT (ISL, 3.0 ms): single-hop satellite-to-satellite Xn; lightweight
+                            protocol, short geographic distance — LOW baseline.
+                            But satellite onboard Xn processor has SMALL capacity,
+                            so the M/M/1 sojourn 1/μ × 1/(1−ρ) inflates fast as
+                            bg_load rises (limited compute, no elastic scaling).
+      TN     (GND, 5.0 ms): ground core Xn signaling traverses more hops
+                            (gNB → AMF → anchor UPF) — HIGHER baseline. But the
+                            ground core has more capacity and elastic scaling,
+                            so the (1−ρ) denominator stays well-bounded since
+                            bg_tn ∈ [0.10, 0.60] (peak ρ much milder than ISL).
+
+    Crossover (access cost only):
+        18 + 3/(1−bg_isl*) = 29 + 5/0.65 = 36.69
+        ⇒ bg_isl* = 0.82    ← inside the [0.20, 0.85] oscillation range,
+                              occurring briefly at the top of each bg cycle.
+
+    Combined with compute, full transition is task-dependent:
+      - light tasks: ISL almost always wins (access dominates, transition at
+                     bg_isl ≈ 0.80 briefly).
+      - instagram:   ISL compute spikes unless UPF-ON-2 is selected. Even with
+                     UPF-ON-2, the compute gap (~4 ms on ISL vs ~0.7 ms on GND)
+                     pulls the transition down to bg_isl ≈ 0.70.
     """
 
     def __init__(self, name: str, ngap_ms: float, xn_base_ms: float):
@@ -222,6 +334,7 @@ class AccessNode:
         self.bg_load    = 0.30
 
     def xn_setup_ms(self) -> float:
+        # M/M/1 sojourn: T = (1/μ)/(1 − ρ).  Floor protects against bg_load → 1.0.
         return self.xn_base_ms / max(1.0 - self.bg_load, 0.05)
 
     def total_access_cost_ms(self, prop_ms: float) -> float:
@@ -332,6 +445,7 @@ class CoreInstance:
         self, name: str, millicores: int, cpu_freq_ghz: float,
         is_onboard: bool, fixed_cpr: int | None, cs: float, ca: float,
         tau_max: float = 2.0,
+        task_cpr: dict[str, int] | None = None,
     ):
         self.name        = name
         self.is_onboard  = is_onboard
@@ -339,16 +453,43 @@ class CoreInstance:
         self.cs          = cs
         self.ca          = ca
         self.tau_max     = tau_max   # per-instance sojourn threshold (ms)
+        self.task_cpr    = task_cpr  # per-task CPR dict (UPF only); None → use fixed_cpr/cpr arg
         self.capacity_hz = (millicores / 1000.0) * cpu_freq_ghz * 1e9
         self.rho    = 0.0
         self.tau_ms = 1.0
-        self.B      = 1.0
+        self.B_hw   = 1.0   # hardware-derived service rate (reset each round by configure)
+        self.B      = 1.0   # effective service rate = B_mult * B_hw  (used in grad + cost)
+        self.B_mult = 1.0   # PERSISTENT exploitation multiplier — never reset by configure()
 
-    def configure(self, cpr: int, n_tasks: int) -> None:
-        effective   = self.fixed_cpr if self.fixed_cpr is not None else cpr
+    def configure(self, cpr: int, n_tasks: int, task_type: str = "", ho_id: int = 0) -> None:
+        # CPR priority: per-instance task dict > fixed_cpr > caller-supplied cpr
+        if self.task_cpr and task_type in self.task_cpr:
+            effective = self.task_cpr[task_type]
+        elif self.fixed_cpr is not None:
+            effective = self.fixed_cpr
+        else:
+            effective = cpr
+
         self.tau_ms = (effective / self.capacity_hz) * 1000.0
-        self.rho    = (n_tasks * effective) / self.capacity_hz
-        self.B      = 1.0 / max(self.tau_ms, 1e-9)
+        base_rho    = (n_tasks * effective) / self.capacity_hz
+
+        # Per-instance background occupancy (AMF/SMF only).
+        # Independent oscillations give each instance a different load trajectory,
+        # so the relative ranking of instances changes over time — creating a
+        # genuine non-stationary learning problem for the LayerScheduler.
+        if self.name in INSTANCE_LOAD_PROFILES:
+            amp, period, phase = INSTANCE_LOAD_PROFILES[self.name]
+            bg = amp * (0.5 + 0.5 * math.sin(2.0 * math.pi * (ho_id / period + phase)))
+            self.rho = min(base_rho + bg, 0.9999)
+        else:
+            self.rho = base_rho
+
+        # B_hw is the hardware service rate (1/τ_ms), updated each round as CPR changes.
+        # B = B_mult × B_hw is the effective rate used in cost/gradient computation.
+        # B_mult is the EXPLOITATION variable — it persists across rounds and is only
+        # updated by exploit_update(). Never reset here.
+        self.B_hw = 1.0 / max(self.tau_ms, 1e-9)
+        self.B    = self.B_mult * self.B_hw
 
     def is_stable(self) -> bool:
         return self.rho < 0.95
@@ -381,6 +522,28 @@ class CoreInstance:
         # ∂/∂x log(1 + B·x) = B/(1 + B·x)  — B must appear in the numerator.
         # _z already clamps B·x to (-0.999, ∞), so the denominator is always >0.
         return self.B / (1.0 + self._z(x))
+
+    def exploit_update(self, x: float) -> None:
+        """
+        Exploitation sub-problem: projected gradient step on B_j (paper §III-B).
+
+        ∂/∂B log(1 + B·x) = x / (1 + B·x)
+
+        When x > 0 (delay > τ_max, overloaded): gradient > 0 → B decreases.
+            Lower B → weaker cost signal → exploration weight grows more slowly
+            → instance is selected less aggressively. Correct: backing off pressure.
+        When x < 0 (delay < τ_max, underloaded): gradient < 0 → B increases.
+            Higher B → stronger gradient on future rounds → faster weight accumulation
+            for this already-good instance. Correct: amplifying the good signal.
+
+        B_mult persists across task-type switches (tracks long-run instance quality).
+        Projected onto [B_MULT_MIN, B_MULT_MAX] × B_hw.
+        """
+        z     = self._z(x)                   # clamp B·x to (-0.999, ∞)
+        grad  = x / (1.0 + z)               # ∂L/∂B, clamped denominator
+        B_new = self.B - ETA_B * grad
+        self.B_mult = max(B_MULT_MIN, min(B_MULT_MAX, B_new / max(self.B_hw, 1e-9)))
+        self.B      = self.B_mult * self.B_hw
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -423,6 +586,7 @@ class LayerScheduler:
                  for i, inst in enumerate(self.instances)]
         x_all = [inst.x_signal(w) for inst, w in zip(self.instances, w_all)]
 
+        # ── Exploration update (Bregman multiplicative weights on x) ─────────────
         for i, inst in enumerate(self.instances):
             exp = min(ETA_X * inst.grad_L(x_all[i]), GRAD_CAP)
             self.weights[i] *= math.exp(exp)
@@ -436,6 +600,13 @@ class LayerScheduler:
                 break
             self.weights[below] = floor
             self.weights /= self.weights.sum()
+
+        # ── Exploitation update (projected gradient on B_j) ───────────────────
+        # Full-information: update B for ALL instances using their x_all signals,
+        # not just the chosen one — same justification as exploration (both access
+        # costs / all expected delays are observable each round).
+        for i, inst in enumerate(self.instances):
+            inst.exploit_update(x_all[i])
 
         chosen = self.instances[idx]
         x_val  = x_all[idx]
@@ -466,6 +637,13 @@ _CSV_HEADER = [
     "gnd_amf_p0", "gnd_amf_p1", "gnd_amf_p2",
     "gnd_smf_p0", "gnd_smf_p1", "gnd_smf_p2",
     "gnd_upf_p0", "gnd_upf_p1", "gnd_upf_p2",
+    # B_mult columns: exploitation learning per instance (1.0 = hardware baseline)
+    "on_amf_B0", "on_amf_B1", "on_amf_B2",
+    "on_smf_B0", "on_smf_B1", "on_smf_B2",
+    "on_upf_B0", "on_upf_B1", "on_upf_B2",
+    "gnd_amf_B0", "gnd_amf_B1", "gnd_amf_B2",
+    "gnd_smf_B0", "gnd_smf_B1", "gnd_smf_B2",
+    "gnd_upf_B0", "gnd_upf_B1", "gnd_upf_B2",
     "global_oracle_ms",
     "access_regret_ms", "inst_regret_ms", "global_regret_ms",
     "cum_access_regret_ms", "cum_inst_regret_ms", "cum_global_regret_ms",
@@ -484,7 +662,7 @@ class Dispatcher:
     total_ms = access_cost_chosen + core_ms  (full HO latency)
     """
 
-    def __init__(self, log_dir: str | Path = "."):
+    def __init__(self, log_dir: str | Path = ".", tag: str = ""):
         self.on_amf  = LayerScheduler([CoreInstance(*p) for p in _ON_AMF_SPECS])
         self.on_smf  = LayerScheduler([CoreInstance(*p) for p in _ON_SMF_SPECS])
         self.gnd_amf = LayerScheduler([CoreInstance(*p) for p in _GND_AMF_SPECS])
@@ -502,13 +680,14 @@ class Dispatcher:
         self.cum_inst_regret   = 0.0
         self.cum_global_regret = 0.0
 
+        suffix  = f"_{tag}" if tag else ""
         log_dir = Path(log_dir)
         self._files:   list = []
         self._writers: dict = {}
-        for key, fname in [("all", "dispatch_log.csv"),
-                            ("ISL", "isl_path_log.csv"),
-                            ("GND", "ground_path_log.csv")]:
-            fh = open(log_dir / fname, "w", newline="")
+        for key, base in [("all", "dispatch_log"),
+                           ("ISL", "isl_path_log"),
+                           ("GND", "ground_path_log")]:
+            fh = open(log_dir / f"{base}{suffix}.csv", "w", newline="")
             wr = csv.DictWriter(fh, fieldnames=_CSV_HEADER, extrasaction="ignore")
             wr.writeheader()
             self._files.append(fh)
@@ -527,15 +706,15 @@ class Dispatcher:
               f"η_path={ETA_PATH}  η_x={ETA_X}  "
               f"τ_max={tau_range} ms (per-instance)  τ_access={TAU_ACCESS} ms  N={n_range} tasks")
 
-    def _configure_all(self, task_type: str) -> None:
+    def _configure_all(self, task_type: str, ho_id: int) -> None:
         n       = TASK_N_TASKS[task_type]
-        upf_cpr = TASK_TYPES[task_type]
+        upf_cpr = TASK_TYPES[task_type]   # fallback; per-instance task_cpr takes priority
         for inst in self.on_amf.instances + self.gnd_amf.instances:
-            inst.configure(AMF_CYCLES, n)
+            inst.configure(AMF_CYCLES, n, task_type, ho_id)
         for inst in self.on_smf.instances + self.gnd_smf.instances:
-            inst.configure(SMF_CYCLES, n)
+            inst.configure(SMF_CYCLES, n, task_type, ho_id)
         for inst in self.on_upf[task_type].instances + self.gnd_upf[task_type].instances:
-            inst.configure(upf_cpr, n)
+            inst.configure(upf_cpr, n, task_type, ho_id)
 
     def _best_compute_ms(self, path: str, task_type: str) -> float:
         """Best stable AMF+SMF+UPF compute on the given path (no access overhead)."""
@@ -545,6 +724,10 @@ class Dispatcher:
         if path == "ISL":
             return best(self.on_amf) + best(self.on_smf) + best(self.on_upf[task_type])
         return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf[task_type])
+
+    def expected_compute_ms(self, path: str, task_type: str) -> float:
+        """Expected best-case compute latency for total-cost gradient to PathScheduler."""
+        return self._best_compute_ms(path, task_type)
 
     def dispatch(
         self,
@@ -560,7 +743,7 @@ class Dispatcher:
         tn_bg:           float = 0.3,
     ) -> tuple[str, dict]:
         self.ho_id += 1
-        self._configure_all(task_type)
+        self._configure_all(task_type, self.ho_id)
 
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
         access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
@@ -605,6 +788,16 @@ class Dispatcher:
         gnd_sp = self.gnd_smf.probabilities()
         gnd_up = self.gnd_upf[task_type].probabilities()
 
+        # B_mult per instance — exploitation learning state
+        def bmults(sched: LayerScheduler) -> list[float]:
+            return [round(inst.B_mult, 4) for inst in sched.instances]
+        on_ab  = bmults(self.on_amf)
+        on_sb  = bmults(self.on_smf)
+        on_ub  = bmults(self.on_upf[task_type])
+        gnd_ab = bmults(self.gnd_amf)
+        gnd_sb = bmults(self.gnd_smf)
+        gnd_ub = bmults(self.gnd_upf[task_type])
+
         # Instantaneous inverse-cost split: greedy load-balanced optimum each round.
         # PathScheduler's learned π_ISL/π_GND should converge toward this over time.
         ic_p_isl, ic_p_gnd = _inverse_cost_split(access_cost_isl, access_cost_gnd)
@@ -645,6 +838,12 @@ class Dispatcher:
             "gnd_amf_p0": round(gnd_ap[0],4), "gnd_amf_p1": round(gnd_ap[1],4), "gnd_amf_p2": round(gnd_ap[2],4),
             "gnd_smf_p0": round(gnd_sp[0],4), "gnd_smf_p1": round(gnd_sp[1],4), "gnd_smf_p2": round(gnd_sp[2],4),
             "gnd_upf_p0": round(gnd_up[0],4), "gnd_upf_p1": round(gnd_up[1],4), "gnd_upf_p2": round(gnd_up[2],4),
+            "on_amf_B0":  on_ab[0],  "on_amf_B1":  on_ab[1],  "on_amf_B2":  on_ab[2],
+            "on_smf_B0":  on_sb[0],  "on_smf_B1":  on_sb[1],  "on_smf_B2":  on_sb[2],
+            "on_upf_B0":  on_ub[0],  "on_upf_B1":  on_ub[1],  "on_upf_B2":  on_ub[2],
+            "gnd_amf_B0": gnd_ab[0], "gnd_amf_B1": gnd_ab[1], "gnd_amf_B2": gnd_ab[2],
+            "gnd_smf_B0": gnd_sb[0], "gnd_smf_B1": gnd_sb[1], "gnd_smf_B2": gnd_sb[2],
+            "gnd_upf_B0": gnd_ub[0], "gnd_upf_B1": gnd_ub[1], "gnd_upf_B2": gnd_ub[2],
             "global_oracle_ms":     round(global_oracle_ms,    3),
             "access_regret_ms":     round(access_regret_ms,    3),
             "inst_regret_ms":       round(inst_regret_ms,      3),
@@ -689,7 +888,7 @@ class RandomDispatcher:
     Same schema as Dispatcher for direct comparison.
     """
 
-    def __init__(self, log_dir: str | Path = "."):
+    def __init__(self, log_dir: str | Path = ".", tag: str = ""):
         self.on_amf  = LayerScheduler([CoreInstance(*p) for p in _ON_AMF_SPECS])
         self.on_smf  = LayerScheduler([CoreInstance(*p) for p in _ON_SMF_SPECS])
         self.on_upf  = LayerScheduler([CoreInstance(*p) for p in _ON_UPF_SPECS])
@@ -702,22 +901,24 @@ class RandomDispatcher:
         self.cum_inst_regret   = 0.0
         self.cum_global_regret = 0.0
 
+        suffix   = f"_{tag}" if tag else ""
         log_dir  = Path(log_dir)
-        self._fh = open(log_dir / "random_log.csv", "w", newline="")
+        fname    = f"random_log{suffix}.csv"
+        self._fh = open(log_dir / fname, "w", newline="")
         self._wr = csv.DictWriter(self._fh, fieldnames=_CSV_HEADER, extrasaction="ignore")
         self._wr.writeheader()
         print(f"[RandomDispatcher] Random path (50/50) + uniform NF  "
-              f"→ {log_dir}/random_log.csv")
+              f"→ {log_dir}/{fname}")
 
-    def _configure_all(self, task_type: str) -> None:
+    def _configure_all(self, task_type: str, ho_id: int) -> None:
         n       = TASK_N_TASKS[task_type]
         upf_cpr = TASK_TYPES[task_type]
         for inst in self.on_amf.instances + self.gnd_amf.instances:
-            inst.configure(AMF_CYCLES, n)
+            inst.configure(AMF_CYCLES, n, task_type, ho_id)
         for inst in self.on_smf.instances + self.gnd_smf.instances:
-            inst.configure(SMF_CYCLES, n)
+            inst.configure(SMF_CYCLES, n, task_type, ho_id)
         for inst in self.on_upf.instances + self.gnd_upf.instances:
-            inst.configure(upf_cpr, n)
+            inst.configure(upf_cpr, n, task_type, ho_id)
 
     def _random_pick(self, sched: LayerScheduler) -> tuple[int, list[float], float, float, float, float]:
         stable = [i for i, inst in enumerate(sched.instances) if inst.is_stable()]
@@ -751,7 +952,7 @@ class RandomDispatcher:
         tn_bg:           float = 0.3,
     ) -> tuple[str, dict]:
         self.ho_id += 1
-        self._configure_all(task_type)
+        self._configure_all(task_type, self.ho_id)
 
         path        = "ISL" if np.random.random() < 0.5 else "GND"
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
