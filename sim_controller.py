@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-controller.py — Orbital geometry controller (dynamic constellation mode)
+sim_controller.py — Orbital geometry controller (dynamic constellation mode, simulation only)
+
+Identical to controller.py except hardware-specific components are removed:
+  - No dest_override.txt writes (no USRP routing)
+  - No NE-ONE REST API
+  - No --delay flag
+  - time.sleep() removed so the simulation runs as fast as possible
+
+Everything else — delays.json, algorithm, orbital geometry, plots — is identical.
 
 Runs a continuous loop that:
   1. Reads current satellite positions from Skyfield (real Starlink TLEs)
   2. Computes ISL and sat-to-ground one-way propagation delays
   3. Writes delays to delays.json — trgSAT.py and TN.py sleep by these
      amounts after receiving a packet, emulating orbital propagation latency
-     (or pushes them to NE-ONE via REST if --delay=NE-ONE is set)
   4. Triggers Xn handover when srcSat elevation drops below threshold;
      at that point it PROMOTES tgtSat → new srcSat, then scans the full
      constellation to pick the next best visible satellite as the new tgtSat
@@ -26,17 +33,11 @@ Fixed mode (SRC_SAT_NAME / TGT_SAT_NAME non-empty):
   Works like the original controller, but still promotes and auto-scans at each
   subsequent HO rather than cycling back to the same fixed pair.
 
-Delay modes (--delay):
-    normal  : write delays.json; trgSAT/TN apply via time.sleep()  [default]
-    NE-ONE  : write delays.json AND push to NE-ONE via REST API each loop tick;
-              trgSAT/TN must also be started with --delay=NE-ONE to skip sleep
-
 Usage:
-    python3 controller.py                        # dynamic auto-select, normal delays
-    python3 controller.py --ho-every 30          # HO every 30 real seconds
-    python3 controller.py --delay NE-ONE         # NE-ONE emulator mode
-    python3 controller.py --list-sats
-    python3 controller.py --find-pass
+    python3 sim_controller.py                        # dynamic auto-select, normal delays
+    python3 sim_controller.py --ho-every 30          # HO every 30 real seconds
+    python3 sim_controller.py --list-sats
+    python3 sim_controller.py --find-pass
 """
 
 from __future__ import annotations
@@ -107,42 +108,31 @@ UPDATE_INTERVAL_S = 2.0
 SIM_TIME_SCALE = 1.0
 
 DELAYS_FILE   = str(_HERE / "delays.json")
-DEST_OVERRIDE = str(_HERE / "dest_override.txt")
 
-# ── NE-ONE config — only used when running with --delay=NE-ONE ────────────────
-# Set NE_ONE_HOST to the IP of your NE-ONE unit.
-# NE_ONE_ISL_LINK / NE_ONE_GND_LINK are the link IDs shown in the NE-ONE GUI
-# (Topology page → click a link → note the ID in the URL or properties panel).
-NE_ONE_HOST     = "192.168.1.100"   # ← change to your NE-ONE IP
-NE_ONE_ISL_LINK = "1"              # ← link ID for ISL  pipe in NE-ONE
-NE_ONE_GND_LINK = "2"              # ← link ID for GND pipe in NE-ONE
-NE_ONE_USER     = ""               # HTTP Basic auth username (leave "" if none)
-NE_ONE_PASS     = ""               # HTTP Basic auth password (leave "" if none)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Task-type rotation ───────────────────────────────────────────────────────
-# Each task type block lasts exactly MIN_TASK_HOS handovers, then the next task
-# in the shuffled rotation starts.  The rotation is TASK_CYCLE repeated enough
-# times to cover HO_HARD_CAP, then shuffled so the order is random but every
-# task appears the same number of times (equal learning exposure).
+# ── Task-type Markov switching ────────────────────────────────────────────────
+# After MIN_TASK_HOS handovers, the current task type transitions according to
+# this stochastic matrix.  Self-transitions keep the same type; effective mean
+# session length ≈ MIN_TASK_HOS / (1 − self_prob).  Row order matches TASK_CYCLE.
 #
-# Why rotation instead of Markov:
-#   The doubly stochastic Markov matrix guarantees a uniform *stationary*
-#   distribution, but in a finite run (280 HOs, ~14 blocks) the variance is
-#   high enough that single tasks can get 5× more blocks than others by chance
-#   (e.g. gaming=15 HOs, youtube=74 HOs was observed).  Rotation gives every
-#   task exactly N_total/5 HOs — reproducible across seeds and easier to justify
-#   in the paper: "traffic classes are cycled in randomised order ensuring equal
-#   learning opportunities per task type."
-MIN_TASK_HOS = 15   # HOs per task block (kept same as before)
+# Design goal: exactly uniform stationary distribution so all 5 task types each
+# receive ~20% of HOs → every per-task PathScheduler and UPF LayerScheduler
+# gets equal samples to learn.  With MIN_TASK_HOS=15 and ~280 total HOs we
+# get ~14 task blocks; self-prob=0.25 gives mean block length 15/(1−0.25)=20 HOs.
+#
+# Matrix is DOUBLY STOCHASTIC (each column sums to 1.0): self-prob=0.25,
+# off-diagonal=0.1875.  This guarantees stationary distribution = [0.2]*5 exactly.
+# The previous asymmetric matrix had column sums 0.95/1.05, causing gaming and
+# instagram to receive ~10% fewer HOs than youtube/browsing in 280-HO runs.
+MIN_TASK_HOS = 15   # minimum HOs per task block before next transition is sampled
 
-# Build a shuffled rotation long enough for HO_HARD_CAP.
-# TASK_CYCLE = ["gaming","youtube","browsing","instagram","mixed"] (5 types).
-# With MIN_TASK_HOS=15 and HO_HARD_CAP=280: need ceil(280/15)=19 blocks → 4
-# full repetitions of TASK_CYCLE gives 20 blocks.  Shuffle for random order.
-_rotation_base = (TASK_CYCLE * ((HO_HARD_CAP // (MIN_TASK_HOS * len(TASK_CYCLE))) + 1))
-random.shuffle(_rotation_base)
-TASK_ROTATION: list[str] = _rotation_base
+TASK_MARKOV: dict[str, list[float]] = {
+    #              gaming   youtube  browsing  instagram  mixed
+    "gaming":     [0.25,    0.1875,  0.1875,   0.1875,   0.1875],
+    "youtube":    [0.1875,  0.25,    0.1875,   0.1875,   0.1875],
+    "browsing":   [0.1875,  0.1875,  0.25,     0.1875,   0.1875],
+    "instagram":  [0.1875,  0.1875,  0.1875,   0.25,     0.1875],
+    "mixed":      [0.1875, 0.1875,  0.1875,   0.1875,   0.25  ],
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── τ_max profiles (operator threshold calibration) ──────────────────────────
@@ -206,7 +196,7 @@ def _apply_tau_profile(profile_name: str) -> None:
     d._GND_SMF_SPECS = _patch(d._GND_SMF_SPECS, "GND_SMF")
     d._GND_UPF_SPECS = _patch(d._GND_UPF_SPECS, "GND_UPF")
 
-    print(f"\n[Controller] τ_max profile: '{profile_name}'")
+    print(f"\n[SimController] τ_max profile: '{profile_name}'")
     print(f"  ON  AMF={p['ON_AMF']:.2f}  SMF={p['ON_SMF']:.2f}  UPF={p['ON_UPF']:.2f}  (ms)")
     print(f"  GND AMF={p['GND_AMF']:.2f}  SMF={p['GND_SMF']:.2f}  UPF={p['GND_UPF']:.2f}  (ms)")
 
@@ -234,8 +224,8 @@ def _write_delays(
 
 def _print_pair_banner(src_name: str, tgt_name: str,
                        src_el: float, tgt_el: float, isl_ms: float):
-    print(f"\n[Controller] srcSat : {src_name:<22}  UE el = {src_el:>6.1f}°")
-    print(f"[Controller] tgtSat : {tgt_name:<22}  UE el = {tgt_el:>6.1f}°  ISL = {isl_ms:.2f} ms")
+    print(f"\n[SimController] srcSat : {src_name:<22}  UE el = {src_el:>6.1f}°")
+    print(f"[SimController] tgtSat : {tgt_name:<22}  UE el = {tgt_el:>6.1f}°  ISL = {isl_ms:.2f} ms")
 
 
 def _print_state_header(scale: float):
@@ -399,7 +389,7 @@ def _trigger_handover(
       3. Level-2: Dispatcher selects AMF/SMF/UPF instances (Bregman)
       4. PathScheduler updated with BOTH access costs (full-information Bregman)
       5. RandomDispatcher: 50/50 random path + uniform NF (baseline)
-      6. Write dest_override.txt, promote tgtSat, scan for next tgtSat
+      6. Promote tgtSat, scan for next tgtSat
 
     Returns True if next tgt satellite was found, False otherwise.
     """
@@ -466,15 +456,6 @@ def _trigger_handover(
             tn_bg           = tn_node.bg_load,
         )
 
-    new_dest = "trgSAT" if path == "ISL" else "TN"
-
-    try:
-        with open(DEST_OVERRIDE, "w") as f:
-            f.write(new_dest)
-        dest_status = f"'{DEST_OVERRIDE}' → '{new_dest}'  [{path} path]"
-    except OSError as e:
-        dest_status = f"WARNING: could not write {DEST_OVERRIDE}: {e}"
-
     old_src = engine.src_sat
     new_src = engine.tgt_sat   # tgt becomes the new serving satellite
 
@@ -499,7 +480,6 @@ def _trigger_handover(
           f"inst={info['inst_regret_ms']:.2f} ms  "
           f"global={info['global_regret_ms']:.2f} ms  "
           f"(cum_global={info['cum_global_regret_ms']:.0f} ms)")
-    print(f"  Routing    : {dest_status}")
     print(f"  Promoting  : {state.tgt_name} → new srcSat  |  "
           f"{state.src_name} → retired")
     print(f"  Scanning full constellation for next tgtSat "
@@ -533,7 +513,7 @@ def _trigger_handover(
 # ── Main control loop ─────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description="Orbital geometry controller (dynamic mode)")
+    p = argparse.ArgumentParser(description="Orbital geometry controller — simulation mode (no USRP)")
     p.add_argument("--list-sats",    action="store_true",
                    help="List all satellite names in TLE file and exit")
     p.add_argument("--find-pass",    action="store_true",
@@ -544,9 +524,6 @@ def main():
                    help="Simulated time acceleration factor")
     p.add_argument("--ho-every",     type=float, default=None, metavar="SECONDS",
                    help="Auto-set time scale to trigger HO approximately every N real seconds")
-    p.add_argument("--delay",        choices=["normal", "NE-ONE"], default="normal",
-                   help="Delay mode: 'normal'=delays.json+receiver sleep (default), "
-                        "'NE-ONE'=also push delays to NE-ONE emulator via REST API")
     p.add_argument("--tau-profile",  choices=list(TAU_PROFILES.keys()), default="default",
                    help="τ_max profile: strict | default | relaxed.  Controls how "
                         "tightly the algorithm's gradient signal is calibrated against "
@@ -575,7 +552,7 @@ def main():
     scale = SIM_TIME_SCALE
     if args.ho_every is not None:
         scale = 5400.0 / args.ho_every
-        print(f"[Controller] --ho-every {args.ho_every}s → SIM_TIME_SCALE = {scale:.1f}×")
+        print(f"[SimController] --ho-every {args.ho_every}s → SIM_TIME_SCALE = {scale:.1f}×")
     elif args.time_scale is not None:
         scale = args.time_scale
 
@@ -595,29 +572,29 @@ def main():
 
     # ── Auto-select initial pair if names not configured ──────────────────────
     if engine.src_sat is None or engine.tgt_sat is None:
-        print(f"\n[Controller] Auto-selecting initial src/tgt pair "
+        print(f"\n[SimController] Auto-selecting initial src/tgt pair "
               f"(scanning {len(engine._all_sats)} satellites, please wait…)", flush=True)
         t0 = time.monotonic()
         src, tgt = engine.two_best_visible(sim_time, min_el=HO_ELEVATION_THRESHOLD_DEG)
         elapsed = time.monotonic() - t0
 
         if src is None:
-            print(f"[Controller] ERROR: No satellites visible above "
+            print(f"[SimController] ERROR: No satellites visible above "
                   f"{HO_ELEVATION_THRESHOLD_DEG}° from UE. "
                   f"Check UE_LAT_DEG / UE_LON_DEG in config.")
             return
         if tgt is None:
-            print(f"[Controller] WARNING: Only one satellite visible above threshold.")
+            print(f"[SimController] WARNING: Only one satellite visible above threshold.")
             tgt = src  # degenerate case; ISL will be 0
 
         engine.update_pair(src, tgt)
-        print(f"[Controller] Scan complete in {elapsed:.1f}s")
+        print(f"[SimController] Scan complete in {elapsed:.1f}s")
 
     # Apply load scale and τ_max profile BEFORE Dispatcher init.
     import dispatcher as _d
     _d.LOAD_SCALE = args.load_scale
     if args.load_scale != 1.0:
-        print(f"[Controller] LOAD_SCALE={args.load_scale}  "
+        print(f"[SimController] LOAD_SCALE={args.load_scale}  "
               f"(N_r scaled: gaming={int(400*args.load_scale)}  "
               f"instagram={int(1000*args.load_scale)})")
     _apply_tau_profile(args.tau_profile)
@@ -627,7 +604,7 @@ def main():
     run_tag  = f"{args.tau_profile}_ls{ls_str}"
     run_dir  = _HERE / "results" / run_tag
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[Controller] Output directory: {run_dir}/")
+    print(f"[SimController] Output directory: {run_dir}/")
 
     dispatcher      = Dispatcher(log_dir=run_dir, tag=run_tag)
     rand_dispatcher = RandomDispatcher(log_dir=run_dir, tag=run_tag)
@@ -635,59 +612,36 @@ def main():
     path_schedulers: dict[str, PathScheduler] = {tt: PathScheduler() for tt in TASK_CYCLE}
 
     # ── Access nodes (srcSAT decides path based on Xn setup cost) ────────────
-    # Full G/G/1 Kingman used for d_i[t] (paper Eq. 3 / Algorithm 1 Eq. 11).
-    # TrgSAT (ISL): xn_base=4.0 ms τ, xn_capacity=2 GHz onboard processor.
-    #               bg_load ∈ [0.20, 0.85] + N_r×100k/2GHz.
-    #               cs=1.2, ca=1.1: bursty onboard CPU — super-Poisson variance
-    #               amplifies Kingman W_q even at moderate ρ, reflecting NTN
-    #               Xn unpredictability.  At scale=2.0 peak ρ≈0.95 → UNSTABLE.
-    # TN     (GND): xn_base=5.0 ms τ, xn_capacity=8 GHz ground server.
-    #               bg_load ∈ [0.10, 0.60] + much smaller N_r component.
-    #               cs=0.6, ca=0.7: near-deterministic ground processing — variance
-    #               multiplier (c_a²+c_s²)/2 ≈ 0.425 keeps d_i bounded vs TrgSAT's
-    #               ≈ 1.325.  Crossover bg_isl* is N_r-dependent: ≈0.80 at scale=1.0.
+    # TrgSAT (ISL): xn_base=4.0 ms baseline, xn_capacity=2 GHz onboard processor.
+    #               bg_load ∈ [0.20, 0.85] + N_r×100k/2GHz N_r-derived component.
+    #               At scale=2.0, peak bg+N_r can reach ρ=0.95 → ISL Xn UNSTABLE.
+    # TN     (GND): xn_base=5.0 ms baseline, xn_capacity=8 GHz ground server.
+    #               bg_load ∈ [0.10, 0.60] + much smaller N_r component → always stable.
+    # Crossover bg_isl* is N_r-dependent: ≈0.83 at scale=0.5, ≈0.80 at scale=1.0,
+    # ≈0.72 at scale=2.0 — heavier load makes GND preferred more often.
     trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=4.0,
-                             xn_capacity_hz=2e9, cs=1.2, ca=1.1)
+                             xn_capacity_hz=2e9)
     tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=5.0,
-                             xn_capacity_hz=8e9, cs=0.6, ca=0.7)
+                             xn_capacity_hz=8e9)
 
-    ho_count          = 0              # total HOs fired
-    task_rotation_idx = 0              # current position in TASK_ROTATION
-    task_type         = TASK_ROTATION[0]
-    task_ho_count     = 0              # HOs elapsed in the current block
-
-    # ── NE-ONE setup ──────────────────────────────────────────────────────────
-    neone = None
-    if args.delay == "NE-ONE":
-        from neone_ctrl import NeoNEController
-        neone = NeoNEController(
-            host        = NE_ONE_HOST,
-            isl_link_id = NE_ONE_ISL_LINK,
-            gnd_link_id = NE_ONE_GND_LINK,
-            username    = NE_ONE_USER,
-            password    = NE_ONE_PASS,
-        )
-        print(f"[Controller] Delay mode : NE-ONE  "
-              f"(delays pushed to {NE_ONE_HOST} each loop tick)")
-        print(f"[Controller] trgSAT.py and TN.py must also be started with --delay=NE-ONE")
-    else:
-        print(f"[Controller] Delay mode : normal  "
-              f"(delays.json written; receivers apply via sleep)")
+    ho_count      = 0            # total HOs fired
+    task_type     = random.choice(TASK_CYCLE)   # random start — no single task gets a head start
+    task_ho_count = 0            # HOs elapsed since last task transition
 
     running = True
     def _stop(*_):
         nonlocal running
         running = False
-        print("\n[Controller] Stopping.")
+        print("\n[SimController] Stopping.")
         dispatcher.close()
         rand_dispatcher.close()
     signal.signal(signal.SIGINT, _stop)
 
     sim_label = (f"  time scale: {scale:.1f}×  (~HO every {5400/scale:.0f}s real)"
                  if scale != 1.0 else "  time scale: real-time")
-    print(f"\n[Controller] HO threshold: srcSat UE elevation < {HO_ELEVATION_THRESHOLD_DEG}°")
-    print(f"[Controller]{sim_label}")
-    print(f"[Controller] Writing delays → '{DELAYS_FILE}'  Ctrl+C to stop")
+    print(f"\n[SimController] HO threshold: srcSat UE elevation < {HO_ELEVATION_THRESHOLD_DEG}°")
+    print(f"[SimController]{sim_label}")
+    print(f"[SimController] Writing delays → '{DELAYS_FILE}'  Ctrl+C to stop")
 
     # Print the initial pair banner before the table header
     init_state = engine.state(unix_time=sim_time)
@@ -714,8 +668,9 @@ def main():
     last_valid_gnd_ms = None
     bad_tick_warned   = False
 
+    _tick_real = time.monotonic()   # real-time anchor for sim_time advancement
+
     while running:
-        loop_start = time.monotonic()
         now_real   = time.monotonic()
 
         state = engine.state(unix_time=sim_time)
@@ -742,8 +697,6 @@ def main():
             state.src_name, state.tgt_name, state.ue_tgt_elevation_deg,
             task_type=task_type,
         )
-        if neone is not None:
-            neone.set_both(isl_for_write, gnd_for_write)
 
         src_el  = state.ue_src_elevation_deg
         ho_flag = ""
@@ -780,14 +733,15 @@ def main():
                 rand_dispatcher.close()
                 break
 
-            # Rotation task switching: after MIN_TASK_HOS HOs advance to the
-            # next slot in the pre-shuffled TASK_ROTATION.  Every task type
-            # appears exactly once per 5 slots → guaranteed equal HO exposure.
+            # Markov task switching: after MIN_TASK_HOS HOs sample the next task.
+            # Self-transitions keep the current type; the minimum block of
+            # MIN_TASK_HOS HOs ensures each per-task scheduler sees enough data
+            # before the environment can shift.
             if task_ho_count >= MIN_TASK_HOS:
-                prev_task         = task_type
-                task_rotation_idx = (task_rotation_idx + 1) % len(TASK_ROTATION)
-                task_type         = TASK_ROTATION[task_rotation_idx]
-                task_ho_count     = 0
+                prev_task     = task_type
+                task_type     = random.choices(TASK_CYCLE,
+                                               weights=TASK_MARKOV[task_type])[0]
+                task_ho_count = 0
                 if task_type != prev_task:
                     print(f"  [Task switch]  {prev_task} → {task_type}  "
                           f"(after {MIN_TASK_HOS} HOs)", flush=True)
@@ -815,11 +769,13 @@ def main():
             flush=True,
         )
 
-        elapsed  = time.monotonic() - loop_start
-        sim_time += UPDATE_INTERVAL_S * scale
-        wait      = UPDATE_INTERVAL_S - elapsed
-        if wait > 0 and running:
-            time.sleep(wait)
+        # Advance sim_time by actual real elapsed time × scale so that
+        # sim-time-to-real-time ratio stays exactly scale× regardless of how
+        # fast each tick computes.  Without this, a fast CPU burns through the
+        # TLE validity window orders of magnitude faster than intended.
+        _now = time.monotonic()
+        sim_time += (_now - _tick_real) * scale
+        _tick_real = _now
 
 
 if __name__ == "__main__":

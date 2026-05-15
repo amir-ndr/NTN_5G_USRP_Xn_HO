@@ -89,26 +89,48 @@ TASK_N_TASKS: dict[str, int] = {
     "mixed":     800,   # average of above
 }
 
-TAU_ACCESS   = 32.0   # total-cost threshold (ms) — Level-1 PathScheduler: x = α(c−τ_a)
-# Calibration: median total cost across both paths is ~30–35 ms.
-#   ISL total = access(26–64) + compute(3–8)  =  29–72 ms
-#   GND total = access(33–39) + compute(1–2)  =  34–41 ms
-# Setting τ_access in the middle gives informative gradients on both sides:
-#   x < 0 → grad = 1/(1+x) is LARGE (positive), instance favoured
-#   x > 0 → grad shrinks toward 0, instance suppressed
-# Per-instance τ_max is now embedded in each CoreInstance spec tuple (8th element).
+# Global load scale factor — multiply all N_r values by this at runtime.
+# Set via controller.py --load-scale or directly before Dispatcher() is constructed.
+#   0.5 = light load   (all NTN-UPF stable under instagram)
+#   1.0 = default load (NTN-UPF-ON0/1 unstable under instagram)
+#   1.5 = heavy load   (all NTN-UPF unstable under instagram, GND takes over)
+#   2.0 = extreme load (NTN-AMF-2 also unstable)
+LOAD_SCALE: float = 1.0
+
+# Xn signaling cost per UE — drives the N_r-dependent ρ contribution in AccessNode.
+# Each UE context transfer during an Xn HO requires approximately this many CPU cycles
+# on the Xn processor (context encode + NG interface signaling + auth token check).
+# Combined with the per-node xn_capacity_hz this determines how much extra queueing
+# load N_r adds on top of the sinusoidal bg_load oscillation.
+XN_CYCLES_PER_UE: int = 100_000
+
+# TAU_ACCESS is no longer used by PathScheduler (paper-correct implementation uses
+# Xn G/G/1 service rate directly).  Kept here only for any legacy references.
+TAU_ACCESS   = 42.0
+
+# Per-instance τ_max is embedded in each CoreInstance spec tuple (8th element).
 # Rationale: TN (GND) instances run on high-clock server CPUs → stricter deadlines;
 # NTN (ON) instances run on power-limited onboard CPUs → relaxed deadlines.
 # Values chosen so each instance's expected delay sits near its τ_max at mid-load,
 # giving the LayerScheduler gradient differentiation across load regimes.
-ALPHA        = 0.1    # cost-signal scaling for both levels:  x = α(w − τ)
+ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
 ETA_X        = 0.05   # Level-2 exploration step (NF instance weight update)
 ETA_B        = 0.02   # Level-2 exploitation step (service-rate B_j update)
-ETA_PATH     = 0.2    # Level-1 (path) Bregman step — positive multiplicative weights
+ETA_PATH     = 0.5    # Level-1 (path) Bregman step — large because grad ≈ 0.03–0.05
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
 PROB_FLOOR   = 0.05   # minimum probability per NF instance (exploration floor)
 B_MULT_MIN   = 0.5    # minimum B_mult (50% of hardware baseline)
 B_MULT_MAX   = 2.0    # maximum B_mult (200% of hardware baseline)
+# Level-1 PathScheduler B parameters.
+# B_i is a SERVICE RATE (1/ms) — NOT a delay.
+# B_i · x_{·,i} = (1/ms) × ms = dimensionless, keeping grad = B/(1+B·x) finite.
+# Storing B as delay (ms) makes B·x ≈ 5×18 = 90 >> 1, collapsing grad to 1/prop.
+#
+# B_PATH_INIT = 0.125 (1/ms): neutral start ≈ 1/8 ms.
+# B_PATH_MAX  = 0.5  (1/ms): safety cap ≈ 1/2 ms; natural ceiling from
+#   delay-domain projection (xns*0.5 ≈ 2–10ms → B ≤ 0.5) makes this rarely active.
+B_PATH_INIT  = 0.125  # initial B_i (1/ms)
+B_PATH_MAX   = 0.5    # upper bound on B_i (1/ms)
 
 # ── Task types: UPF CPR fallback (used only if instance has no task_cpr dict) ──
 # With per-instance task_cpr, these values are superseded for UPF instances.
@@ -292,7 +314,11 @@ class AccessNode:
     total_access_cost = prop_ms + xn_setup_ms
       prop_ms     — orbital propagation delay (real Skyfield geometry).
                     Typical: ISL ≈ 15–22 ms, GND ≈ 25–32 ms.
-      xn_setup_ms = xn_base_ms / (1 − bg_load)  — M/M/1 sojourn approximation.
+      xn_setup_ms — full G/G/1 Kingman sojourn (paper Eq. 3 / Algorithm 1 d_i[t]):
+                      W_q = ρ/(1−ρ) × (c_a² + c_s²)/2 × τ
+                      d_i = W_q + τ
+                    This is the same formula used for NF instances and is the d_i[t]
+                    fed into the B_i exploitation update (Algorithm 1, Eq. 11).
 
     PHASE TRANSITION DESIGN (Level-1 PathScheduler tradeoff)
     ────────────────────────────────────────────────────────
@@ -302,40 +328,53 @@ class AccessNode:
       Low  bg_isl  → access(ISL) < access(GND)   (ISL wins; shorter prop, simpler Xn)
       High bg_isl  → access(ISL) > access(GND)   (GND wins; ISL Xn queue blows up)
 
-    Physics of xn_base_ms (baseline 1/μ — service time when queue is empty):
-      TrgSAT (ISL, 3.0 ms): single-hop satellite-to-satellite Xn; lightweight
-                            protocol, short geographic distance — LOW baseline.
-                            But satellite onboard Xn processor has SMALL capacity,
-                            so the M/M/1 sojourn 1/μ × 1/(1−ρ) inflates fast as
-                            bg_load rises (limited compute, no elastic scaling).
+    Physics of xn_base_ms (baseline τ = 1/μ — mean service time when queue is empty):
+      TrgSAT (ISL, 4.0 ms): onboard satellite Xn processor — LOW capacity, bursty
+                            signaling (high c_s, high c_a).  G/G/1 Kingman inflates
+                            fast as bg_load rises AND is amplified by the variance
+                            terms, correctly reflecting satellite Xn unpredictability.
       TN     (GND, 5.0 ms): ground core Xn signaling traverses more hops
-                            (gNB → AMF → anchor UPF) — HIGHER baseline. But the
-                            ground core has more capacity and elastic scaling,
-                            so the (1−ρ) denominator stays well-bounded since
-                            bg_tn ∈ [0.10, 0.60] (peak ρ much milder than ISL).
+                            (gNB → AMF → anchor UPF) — HIGHER baseline, but ground
+                            servers have stable service (low c_s, low c_a), so the
+                            variance multiplier is smaller and d_i stays bounded.
 
-    Crossover (access cost only):
-        18 + 3/(1−bg_isl*) = 29 + 5/0.65 = 36.69
-        ⇒ bg_isl* = 0.82    ← inside the [0.20, 0.85] oscillation range,
-                              occurring briefly at the top of each bg cycle.
+    Coefficients of variation (paper G/G/1 notation):
+      c_a — CoV of inter-arrival times (burstiness of incoming Xn requests)
+      c_s — CoV of service times (variability of Xn processing duration)
+      For M/M/1: c_a = c_s = 1.0  (Poisson arrivals, exponential service)
+      TrgSAT uses c_s=1.2, c_a=1.1 — slightly super-Poisson (bursty onboard CPU)
+      TN     uses c_s=0.6, c_a=0.7 — sub-Poisson (deterministic ground processing)
 
-    Combined with compute, full transition is task-dependent:
-      - light tasks: ISL almost always wins (access dominates, transition at
-                     bg_isl ≈ 0.80 briefly).
-      - instagram:   ISL compute spikes unless UPF-ON-2 is selected. Even with
-                     UPF-ON-2, the compute gap (~4 ms on ISL vs ~0.7 ms on GND)
-                     pulls the transition down to bg_isl ≈ 0.70.
+    Crossover (access cost only) is N_r-dependent:
+        Total ρ = bg_load + n_r × XN_CYCLES_PER_UE / xn_capacity_hz
+        At scale=1.0 (instagram, N_r=1000):
+          ISL ρ_nr = 0.05  →  crossover bg_isl* ≈ 0.80  (inside [0.20, 0.85] range)
+        At scale=2.0 (instagram, N_r=2000):
+          ISL ρ_nr = 0.10  →  crossover bg_isl* ≈ 0.72  (more frequent GND preference)
+          At peak bg (0.85) + ρ_nr=0.10 = 0.95  →  ISL Xn UNSTABLE  (strong GND pull)
+        At scale=0.5 (instagram, N_r=500):
+          ISL ρ_nr = 0.025 →  crossover bg_isl* ≈ 0.83  (ISL almost always preferred)
     """
 
-    def __init__(self, name: str, ngap_ms: float, xn_base_ms: float):
-        self.name       = name
-        self.ngap_ms    = ngap_ms    # kept for reference; excluded from cost signal
-        self.xn_base_ms = xn_base_ms
-        self.bg_load    = 0.30
+    def __init__(self, name: str, ngap_ms: float, xn_base_ms: float,
+                 xn_capacity_hz: float = 4e9,
+                 cs: float = 1.0, ca: float = 1.0):
+        self.name           = name
+        self.ngap_ms        = ngap_ms      # kept for reference; excluded from cost signal
+        self.xn_base_ms     = xn_base_ms
+        self.xn_capacity_hz = xn_capacity_hz
+        self.cs             = cs           # CoV of service time  (paper G/G/1 d_i)
+        self.ca             = ca           # CoV of inter-arrival time
+        self.bg_load        = 0.30
+        self.n_r            = 0            # updated each HO by controller
 
     def xn_setup_ms(self) -> float:
-        # M/M/1 sojourn: T = (1/μ)/(1 − ρ).  Floor protects against bg_load → 1.0.
-        return self.xn_base_ms / max(1.0 - self.bg_load, 0.05)
+        # Full G/G/1 Kingman formula — matches paper Eq. 3 / Algorithm 1 d_i[t].
+        # W_q = ρ/(1−ρ) × (c_a² + c_s²)/2 × τ;  d_i = W_q + τ
+        rho_nr    = (self.n_r * XN_CYCLES_PER_UE) / self.xn_capacity_hz
+        rho       = min(self.bg_load + rho_nr, 0.9999)
+        W_q       = (rho / (1.0 - rho)) * ((self.ca**2 + self.cs**2) / 2.0) * self.xn_base_ms
+        return W_q + self.xn_base_ms
 
     def total_access_cost_ms(self, prop_ms: float) -> float:
         # NGAP excluded: prop + Xn setup only.
@@ -372,55 +411,88 @@ def compute_traffic_split(
 
 class PathScheduler:
     """
-    Bregman mirror descent over {ISL, GND} — one instance per task type.
+    Paper Algorithm 1 — access-level two-arm Bregman (paper §III-B, i=1 dispatcher).
 
-    Mirrors the paper's Algorithm 1 at the access (path-selection) level:
-        For EACH path i' ∈ {ISL, GND} every round (full-information update):
-            x_{i',i}[t] = α (access_cost_{i'}[t] − τ_access)
-            z            = max(x, −0.999)
-            grad_L(x)    = 1 / (1 + z)      [gradient of log(1+z)]
-            log_w[i']   += η_path · min(grad_L, GRAD_CAP)
-        log_w -= log_w.max()    (re-centre to prevent overflow)
+    Dimensional convention — CRITICAL:
+        x_{·,i}[t] = d_prop_i[t]   (propagation delay, ms)
+        B_i[t]     = 1/d_xn_i[t]   (Xn service RATE, 1/ms)
+        B_i · x_i  = (1/ms) × ms   = dimensionless  ← grad stays finite and varies
 
-    Both access costs are observable every round (satellite geometry gives both
-    isl_ms and gnd_ms regardless of which path is dispatched), so the full-
-    information Bregman update is used — not bandit/one-sided feedback.
+    Exploration arm:
+        grad_i = ∂/∂x log(1+B·x) = B/(1+B·x)
+        log_w[i] += η_path · grad_i
+        Short prop (small x) → smaller Bx → larger grad → ISL preferred.
+        Large B (fast Xn) → larger numerator → gradient amplified.
 
-    Lower access cost → more negative x → larger gradient → higher weight:
-    the scheduler converges to the cheaper path without positive-feedback collapse.
+    Exploitation arm (B_i update in delay domain — paper-correct ∇L^T·x):
+        ∇L(B·x)^T · x = Bx/(1+Bx)   dimensionless ∈ [−1, 1)
+        d_B  = 1/B_i                  (current delay estimate, ms)
+        correction = B_i·x_i/(1+B_i·x_i)          (dimensionless)
+        d_new = d_B · (1 − η_path · correction)    (ms × scalar = ms)
+        Project: d_new in [xn_ms/2, xn_ms×2]  (tracks Xn, bounded)
+        B_i = 1/d_new
+        Fast Xn → d_new shrinks → B rises → exploration gradient grows.
+        Slow Xn → d_new grows toward xn_ms → B falls → gradient weakens.
+
+    Both paths update every round (full-information).
     """
 
     def __init__(self) -> None:
-        self.log_w = np.zeros(2)   # [log_w_ISL, log_w_GND]
+        self.log_w = np.zeros(2)               # [log_w_ISL, log_w_GND]
+        self.B     = np.full(2, B_PATH_INIT)   # [B_ISL, B_GND] in 1/ms (service rate)
         self.p_isl = 0.5
         self.p_gnd = 0.5
 
     def _compute_probs(self) -> np.ndarray:
         w = np.exp(self.log_w - self.log_w.max())
         p = w / w.sum()
-        floor = PROB_FLOOR / 2          # 2.5% per path — guarantees exploration
+        floor = PROB_FLOOR / 2
         p = np.maximum(p, floor)
         p /= p.sum()
         return p
 
     def sample(self) -> str:
-        """Sample path; sets p_isl/p_gnd for logging."""
         p = self._compute_probs()
         self.p_isl = float(p[0])
         self.p_gnd = float(p[1])
         return "ISL" if np.random.random() < self.p_isl else "GND"
 
-    def update(self, access_cost_isl: float, access_cost_gnd: float) -> None:
-        """Full-information update: both paths' access costs are observed every round."""
-        for idx, cost in [(0, access_cost_isl), (1, access_cost_gnd)]:
-            x    = ALPHA * (cost - TAU_ACCESS)
-            z    = max(x, -0.999)
-            grad = min(1.0 / (1.0 + z), GRAD_CAP)
+    def update(
+        self,
+        xn_isl_ms: float, xn_gnd_ms: float,
+        isl_ms:    float, gnd_ms:    float,
+    ) -> None:
+        """
+        Full-information update every round.
+        xn_isl_ms, xn_gnd_ms: Xn G/G/1 setup delay from AccessNode.xn_setup_ms() (ms).
+        isl_ms, gnd_ms:        one-way propagation delay from orbital geometry (ms).
+        B in 1/ms (service rate); x in ms (prop delay) → B·x dimensionless.
+        """
+        props = [isl_ms,    gnd_ms]      # x_{·,i}: prop delay (ms)
+        xns   = [xn_isl_ms, xn_gnd_ms]  # d_i[t]:  Xn G/G/1 sojourn (ms)
+
+        for idx in range(2):
+            x_i = props[idx]
+            Bx  = self.B[idx] * x_i      # dimensionless ✓
+
+            # ── Exploration: grad = B/(1+B·x) ────────────────────────────────
+            grad = min(self.B[idx] / (1.0 + Bx), GRAD_CAP)
             self.log_w[idx] += ETA_PATH * grad
+
+            # ── Exploitation: delay-domain multiplicative step ────────────────
+            # Paper: ∇L(B·x)^T·x = Bx/(1+Bx) — dimensionless ∈ [−1, 1).
+            # Multiply d_B (not subtract) so units stay ms throughout.
+            correction = Bx / (1.0 + Bx)                              # dimensionless ✓
+            d_B    = 1.0 / max(self.B[idx], 1e-9)                     # current delay (ms)
+            d_new  = d_B * (1.0 - ETA_PATH * correction)              # ms × scalar = ms ✓
+            d_new  = max(xns[idx] * 0.5, min(xns[idx] * 2.0, d_new))  # project
+            self.B[idx] = min(B_PATH_MAX, 1.0 / max(d_new, 1e-9))
+
         self.log_w -= self.log_w.max()
 
     def status(self) -> str:
-        return f"π_ISL={self.p_isl:.3f}  π_GND={self.p_gnd:.3f}"
+        return (f"π_ISL={self.p_isl:.3f}  π_GND={self.p_gnd:.3f}  "
+                f"B_ISL={self.B[0]:.4f}  B_GND={self.B[1]:.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -527,21 +599,21 @@ class CoreInstance:
         """
         Exploitation sub-problem: projected gradient step on B_j (paper §III-B).
 
-        ∂/∂B log(1 + B·x) = x / (1 + B·x)
+        Paper gradient: ∇L(B·x)^T · x = Bx/(1+Bx)  — dimensionless ∈ [−1, 1).
 
-        When x > 0 (delay > τ_max, overloaded): gradient > 0 → B decreases.
+        When x > 0 (delay > τ_max, overloaded): Bx > 0 → grad > 0 → B decreases.
             Lower B → weaker cost signal → exploration weight grows more slowly
             → instance is selected less aggressively. Correct: backing off pressure.
-        When x < 0 (delay < τ_max, underloaded): gradient < 0 → B increases.
+        When x < 0 (delay < τ_max, underloaded): Bx < 0 → grad < 0 → B increases.
             Higher B → stronger gradient on future rounds → faster weight accumulation
             for this already-good instance. Correct: amplifying the good signal.
 
         B_mult persists across task-type switches (tracks long-run instance quality).
         Projected onto [B_MULT_MIN, B_MULT_MAX] × B_hw.
         """
-        z     = self._z(x)                   # clamp B·x to (-0.999, ∞)
-        grad  = x / (1.0 + z)               # ∂L/∂B, clamped denominator
-        B_new = self.B - ETA_B * grad
+        z     = self._z(x)                            # clamp B·x to (-0.999, ∞)
+        grad  = z / (1.0 + z)                         # Bx/(1+Bx) — dimensionless ✓
+        B_new = self.B - ETA_B * grad * self.B_hw     # scale to 1/ms units
         self.B_mult = max(B_MULT_MIN, min(B_MULT_MAX, B_new / max(self.B_hw, 1e-9)))
         self.B      = self.B_mult * self.B_hw
 
@@ -703,11 +775,11 @@ class Dispatcher:
         tau_vals  = [inst.tau_max for inst in all_instances]
         tau_range = f"{min(tau_vals):.1f}–{max(tau_vals):.1f}"
         print(f"[Dispatcher] Two-level Bregman  "
-              f"η_path={ETA_PATH}  η_x={ETA_X}  "
-              f"τ_max={tau_range} ms (per-instance)  τ_access={TAU_ACCESS} ms  N={n_range} tasks")
+              f"η_path={ETA_PATH}  η_x={ETA_X}  B_PATH_INIT={B_PATH_INIT}  "
+              f"τ_max={tau_range} ms (per-instance)  N={n_range} tasks")
 
     def _configure_all(self, task_type: str, ho_id: int) -> None:
-        n       = TASK_N_TASKS[task_type]
+        n       = int(TASK_N_TASKS[task_type] * LOAD_SCALE)
         upf_cpr = TASK_TYPES[task_type]   # fallback; per-instance task_cpr takes priority
         for inst in self.on_amf.instances + self.gnd_amf.instances:
             inst.configure(AMF_CYCLES, n, task_type, ho_id)
@@ -911,7 +983,7 @@ class RandomDispatcher:
               f"→ {log_dir}/{fname}")
 
     def _configure_all(self, task_type: str, ho_id: int) -> None:
-        n       = TASK_N_TASKS[task_type]
+        n       = int(TASK_N_TASKS[task_type] * LOAD_SCALE)
         upf_cpr = TASK_TYPES[task_type]
         for inst in self.on_amf.instances + self.gnd_amf.instances:
             inst.configure(AMF_CYCLES, n, task_type, ho_id)

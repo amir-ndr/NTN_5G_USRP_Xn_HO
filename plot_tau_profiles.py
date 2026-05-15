@@ -2,17 +2,25 @@
 """
 plot_tau_profiles.py — τ_max profile comparison plots
 
+Reads CSVs from results/{profile}_ls1/ (load scale = 1.0, the default).
+Each profile run must have been produced by:
+    python3 controller.py --tau-profile default  --load-scale 1.0
+    python3 controller.py --tau-profile strict   --load-scale 1.0
+    python3 controller.py --tau-profile relaxed  --load-scale 1.0
+
 Generates:
   1. Cumulative global regret vs HO index (all 3 profiles + random baseline)
   2. Running-average end-to-end latency vs HO index (all 3 profiles + random)
   3. Path probability (π_ISL) vs HO index (all 3 profiles)
   4. Ground core instance selection probability — one figure per τ profile
   5. Onboard core instance selection probability — one figure per τ profile
+  6. UPF instance selection — 2×3 panel (Ground/Onboard × 3 profiles)
 
 Output: tau_result/
 """
 
 from pathlib import Path
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -21,16 +29,38 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 # ── paths ──────────────────────────────────────────────────────────────────────
-HERE     = Path(__file__).resolve().parent
-OUT_DIR  = HERE / "tau_result"
+HERE        = Path(__file__).resolve().parent
+RESULTS_DIR = HERE / "results"
+OUT_DIR     = HERE / "tau_result"
 OUT_DIR.mkdir(exist_ok=True)
 
+# Load scale used for the τ_max comparison (always 1.0 → suffix "ls1").
+# Adjust LS_TAG here if you ran the profiles at a different --load-scale.
+LS_TAG = "ls1"
+
+def _csv(profile: str, prefix: str) -> Path:
+    tag = f"{profile}_{LS_TAG}"
+    return RESULTS_DIR / tag / f"{prefix}_{tag}.csv"
+
 FILES = {
-    "default": HERE / "dispatch_log_default.csv",
-    "strict":  HERE / "dispatch_log_strict.csv",
-    "relaxed": HERE / "dispatch_log_relaxed.csv",
+    "default": _csv("default", "dispatch_log"),
+    "strict":  _csv("strict",  "dispatch_log"),
+    "relaxed": _csv("relaxed", "dispatch_log"),
 }
-RANDOM_FILE = HERE / "random_log.csv"
+RANDOM_FILE = _csv("default", "random_log")
+
+# Verify all required files exist before attempting to load anything.
+missing = [(name, path) for name, path in {**FILES, "random": RANDOM_FILE}.items()
+           if not path.exists()]
+if missing:
+    print("ERROR: the following CSV files were not found:", file=sys.stderr)
+    for name, path in missing:
+        print(f"  [{name}]  {path}", file=sys.stderr)
+    print("\nRun the three profile simulations first:", file=sys.stderr)
+    for profile in ["default", "strict", "relaxed"]:
+        print(f"  python3 controller.py --tau-profile {profile} --load-scale 1.0",
+              file=sys.stderr)
+    sys.exit(1)
 
 # ── style ──────────────────────────────────────────────────────────────────────
 PROFILE_COLOR = {"default": "#2196F3", "strict": "#F44336", "relaxed": "#4CAF50"}

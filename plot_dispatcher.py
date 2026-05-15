@@ -30,9 +30,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 _HERE    = Path(__file__).resolve().parent
-LOG_CSV  = _HERE / "dispatch_log.csv"
-RAND_CSV = _HERE / "random_log.csv"
-OUT_PNG  = _HERE / "results_dispatcher.png"
+LOG_CSV  = _HERE / "results/default_ls1/dispatch_log_default_ls1.csv"
+RAND_CSV = _HERE / "results/default_ls1/random_log_default_ls1.csv"
+OUT_PNG  = _HERE / "results/default_ls1/results_dispatcher_ls1.png"
 
 CLIP_MS        = 70.0   # display clip for delay panel
 OUTLIER_THRESH = 150.0  # exclude from per-task averages
