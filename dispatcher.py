@@ -452,15 +452,26 @@ class PathScheduler:
             node_i = nodes[idx]
             xn_base_ms = node_i.xn_base_ms if node_i is not None else 4.0  # trgSAT≈4ms, TN≈5ms
 
-            # ── Set B to inverse of BASE Xn delay (not measured sojourn) ──────────────────
-            # B = 1/xn_base_ms creates the inverse-cost oracle without circular feedback.
-            # Using xn_setup_ms() (which includes W_q) creates oscillation:
-            #   B↓ → ρ↑ → W_q↑ → xn_setup↑ → B↓ (unstable loop)
-            # Using xn_base_ms (fixed service time) breaks the loop.
-            self.B[idx] = 1.0 / max(xn_base_ms, 1e-9)
+            # ── Set B to target utilization ρ ≈ 0.35 (realistic Xn operating point) ────────
+            # B = TARGET_RHO / xn_base_ms makes ρ = B × xn_base ≈ 0.35 (avoids Kingman blowup)
+            # This gives xn_setup ≈ 6-7 ms (realistic), not 30+ ms from ρ=0.85 cap.
+            # With this B, the exploration gradient becomes:
+            #   grad = B/(1+B·x) ∝ 1/(xn_base + x_prop) ≈ 1/access_cost
+            TARGET_RHO = 0.35
+            B_target = TARGET_RHO / max(xn_base_ms, 1e-9)
+
+            # ── Exploitation: small gradient step to adapt B over time ────────────────────
+            # Restore the learning arm: B adapts slowly based on observed delay
+            # ∂L/∂B = x/(1+B·x); safe step size ETA_B_PATH avoids oscillation
+            Bx_current = self.B[idx] * x_i
+            grad_B = x_i / (1.0 + Bx_current)  # ∂L/∂B, dimensionless
+            ETA_B_PATH = 0.0005  # ~0.00005 per step, reaches equilibrium in ~280 HOs
+            B_updated = self.B[idx] - ETA_B_PATH * grad_B
+
+            # Blend toward target: slow adaptive learning + stability
+            self.B[idx] = 0.95 * B_target + 0.05 * B_updated
 
             # ── Exploration: grad = B/(1+B·x) — inverse-cost weighting ──────────
-            # With B = 1/d_base, grad = 1/(d_base + x_prop) = 1/access_cost (approximately)
             Bx   = self.B[idx] * x_i      # dimensionless ✓
             grad = min(self.B[idx] / (1.0 + Bx), GRAD_CAP)
             self.log_w[idx] += ETA_PATH * grad
