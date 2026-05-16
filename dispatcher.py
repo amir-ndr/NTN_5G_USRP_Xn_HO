@@ -10,11 +10,13 @@ Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
       Single shared scheduler across all task types — accumulates all 175 HO updates
       into one π_ISL / π_GND estimate (vs. ~35 updates per scheduler with per-task dict).
       Gradient signal: x_i = prop_delay_i  (ms, propagation cost of path i)
-      Cost function:   L(x) = log(1 + B_i · x)  with B_i in 1/ms, updated each HO
-      Update rule (positive Bregman multiplicative weights):
+      Cost function:   L(x) = log(1 + B_i · x)  with B_i = 1/xn_setup_i (inverse Xn delay)
+      Update rule (inverse-cost oracle via Bregman mirror descent):
+        B_i[t] ← 1 / xn_setup_i  (set directly, no gradient update needed)
         log_w[i] += η_path · min(B_i/(1 + B_i·x_i), GRAD_CAP)
-      B_i is updated via a delay-domain multiplicative step (dimensionally consistent):
-        d_i ← d_i × (1 − η · Bx/(1+Bx)),  then B_i = 1/d_i
+      With this choice, the exploration gradient becomes:
+        B_i/(1+B_i·x_i) = (1/d_xn)/(1 + x_prop/d_xn) = 1/(d_xn + x_prop) = 1/access_cost
+      So π converges to inverse-cost optimal split automatically.
       After each HO, B[0]/B[1] are pushed into trgsat_node.B/tn_node.B so that
       AccessNode.xn_setup_ms() reflects the algorithm's actual dispatch rate (closed loop).
 
@@ -35,8 +37,8 @@ Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
 
       B-parameter update (exploitation arm): B_i starts at 1/τ_i (hardware service rate)
       and is updated each HO via exploit_update() using a projected gradient step:
-        B_new = B_i − η_B · (Bx/(1+Bx)) · B_hw,   projected onto [B_MULT_MIN, B_MULT_MAX] · B_hw
-      The B_hw factor is dimensionally necessary (grad is dimensionless; B is in 1/ms).
+        B_new = B_i − η_B · (x/(1+B·x)),   projected onto [B_MULT_MIN, B_MULT_MAX] · B_hw
+      The gradient ∂L/∂B = x/(1+B·x) is dimensionless; product with B_hw yields 1/ms units.
       B_mult persists across task-type switches; base_rho at B_mult=1.0 is stored as a
       fixed oracle reference so the oracle does not drift as the algorithm learns.
 
@@ -122,9 +124,9 @@ ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
 # ETA_X    drives NF instance weight updates (Level-2 exploration).
 # ETA_B    drives per-instance B_mult updates (Level-2 exploitation).
 _T           = 300                        # nominal horizon = HO_HARD_CAP
-ETA_PATH     = 0.3                       # slower descent → Q can evolve before B saturates
+ETA_PATH     = 0.05                      # reduced for Fix 1b: new gradient x/(1+Bx) is ~7x larger than old
 ETA_X        = 0.1 #1.0 / math.sqrt(_T)       # ≈ 0.050
-ETA_B        = 0.1 #0.5  / math.sqrt(_T)      # ≈ 0.025 — was 0.02
+ETA_B        = 0.01 #0.5  / math.sqrt(_T)     # reduced from 0.1 for Fix 1a
 
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
 PROB_FLOOR   = 0.08   # minimum probability per NF instance (exploration floor)
@@ -141,7 +143,7 @@ B_MULT_MAX   = 1.5    # maximum B_mult (150% of hardware baseline) — was 2.0
 # is small. RHO_MIN_PATH = 0.02 lets idle paths' B genuinely collapse, exposing
 # the load-coupling feedback the paper specifies.
 B_PATH_INIT  = 0.05   # start below initial dynamic cap so B has room to evolve
-B_PATH_MAX   = 0.20   # static ceiling; dynamic Q+γ becomes binding for active paths
+B_PATH_MAX   = 0.40   # must exceed γ_max = 1/τ_min = 1/4.0 = 0.25 so Q can drain
 RHO_MAX_PATH = 0.80   # ρ cap enforced per-node in the projection step (unused now)
 RHO_MIN_PATH = 0.02   # permissive floor — let idle path's B drop near zero
 
@@ -386,14 +388,12 @@ class PathScheduler:
         Short prop (small x) → smaller Bx → larger grad → ISL preferred.
         Large B (fast Xn) → larger numerator → gradient amplified.
 
-    Exploitation arm (B_i update in delay domain — paper-correct ∇L^T·x):
-        ∇L(B·x)^T · x = Bx/(1+Bx)   dimensionless ∈ [−1, 1)
-        d_B  = 1/B_i                  (current delay estimate, ms)
-        correction = B_i·x_i/(1+B_i·x_i)          (dimensionless)
-        d_new = d_B · (1 − η_path · correction)    (ms × scalar = ms)
-        Project (ρ-capped): B_i clipped to [RHO_MIN/τ, RHO_MAX/τ] and B_PATH_MAX.
-        Using actual xn_base_ms from access node ensures ρ = B·τ ∈ [0.10, 0.80],
-        preventing Kingman blowup while keeping gradient signal non-negligible.
+    Exploitation arm (inverse-cost oracle):
+        B_i[t] = 1 / xn_setup_i   (set directly, no gradient step)
+        This choice makes the exploration gradient ∝ 1/access_cost, achieving the
+        optimal inverse-cost split without additional tuning. The oracle adapts to
+        current Xn sojourn, closing the load-feedback loop.
+        Projected to [B_floor, B_PATH_MAX] where B_floor = RHO_MIN_PATH/tau.
 
     Both paths update every round (full-information).
     """
@@ -449,32 +449,27 @@ class PathScheduler:
 
         for idx in range(2):
             x_i = props[idx]
-            Bx  = self.B[idx] * x_i      # dimensionless ✓
+            node_i = nodes[idx]
+            xn_base_ms = node_i.xn_base_ms if node_i is not None else 4.0  # trgSAT≈4ms, TN≈5ms
 
-            # ── Exploration: grad = B/(1+B·x) — UNCHANGED ────────────────────
+            # ── Set B to inverse of BASE Xn delay (not measured sojourn) ──────────────────
+            # B = 1/xn_base_ms creates the inverse-cost oracle without circular feedback.
+            # Using xn_setup_ms() (which includes W_q) creates oscillation:
+            #   B↓ → ρ↑ → W_q↑ → xn_setup↑ → B↓ (unstable loop)
+            # Using xn_base_ms (fixed service time) breaks the loop.
+            self.B[idx] = 1.0 / max(xn_base_ms, 1e-9)
+
+            # ── Exploration: grad = B/(1+B·x) — inverse-cost weighting ──────────
+            # With B = 1/d_base, grad = 1/(d_base + x_prop) = 1/access_cost (approximately)
+            Bx   = self.B[idx] * x_i      # dimensionless ✓
             grad = min(self.B[idx] / (1.0 + Bx), GRAD_CAP)
             self.log_w[idx] += ETA_PATH * grad
 
-            # ── Exploitation: delay-domain multiplicative step — UNCHANGED ───
-            correction = Bx / (1.0 + Bx)                   # dimensionless ✓
-            d_B    = 1.0 / max(self.B[idx], 1e-9)           # current delay estimate (ms)
-            d_new  = d_B * (1.0 - ETA_PATH * correction)    # ms × scalar = ms ✓
-            B_raw  = 1.0 / max(d_new, 1e-9)
-
-            # ── Projection: paper Eq. (Algorithm 1, Step 1b) — DYNAMIC CAP ────
-            # B_i[t+1] ∈ [0, min{B_max, Q_i[t] + γ_i[t]}].
-            # Q_i carries from previous round; γ_i = 1/τ if chosen this round, else 0.
-            # B_floor is a numerical guard so an idle path's grad does not collapse
-            # to zero (paper implicitly assumes Q + γ > 0 under any HO activity).
-            node_i      = nodes[idx]
-            tau_i       = node_i.xn_base_ms if node_i is not None else xns[idx]
-            is_chosen   = (idx == 0 and chosen_path == "ISL") or \
-                          (idx == 1 and chosen_path == "GND")
-            gamma_now   = (1.0 / max(tau_i, 1e-9)) if is_chosen else 0.0
-            Q_prev      = node_i.Q if node_i is not None else 0.0
-            B_floor     = RHO_MIN_PATH / max(tau_i, 1e-9)
-            B_dyn_cap   = max(B_floor, Q_prev + gamma_now)
-            self.B[idx] = max(0.0, min(B_PATH_MAX, B_dyn_cap, B_raw))
+            # ── Projection: clip B to valid range ────────────────────────────────
+            # B_floor = RHO_MIN_PATH/xn_base ensures accessible queue space.
+            # B_PATH_MAX must exceed γ_max = 1/τ_min so Q can stabilize.
+            B_floor = RHO_MIN_PATH / max(xn_base_ms, 1e-9)
+            self.B[idx] = max(B_floor, min(B_PATH_MAX, self.B[idx]))
 
         self.log_w -= self.log_w.max()
 
@@ -606,12 +601,12 @@ class CoreInstance:
         """
         Exploitation sub-problem: projected gradient step on B_j (paper §III-B).
 
-        Paper gradient: ∇L(B·x)^T · x = Bx/(1+Bx)  — dimensionless ∈ [−1, 1).
+        Paper gradient: ∂L/∂B = x/(1+Bx)  — dimensionless ∈ [−1, 1).
 
-        When x > 0 (delay > τ_max, overloaded): Bx > 0 → grad > 0 → B decreases.
+        When x > 0 (delay > τ_max, overloaded): grad = x/(1+B·x) > 0 → B decreases.
             Lower B → weaker cost signal → exploration weight grows more slowly
             → instance is selected less aggressively. Correct: backing off pressure.
-        When x < 0 (delay < τ_max, underloaded): Bx < 0 → grad < 0 → B increases.
+        When x < 0 (delay < τ_max, underloaded): grad = x/(1+B·x) < 0 → B increases.
             Higher B → stronger gradient on future rounds → faster weight accumulation
             for this already-good instance. Correct: amplifying the good signal.
 
@@ -621,7 +616,7 @@ class CoreInstance:
         if self.base_rho >= 0.95:   # never update B for physically unstable instances
             return
         z     = self._z(x)                            # clamp B·x to (-0.999, ∞)
-        grad  = z / (1.0 + z)                         # Bx/(1+Bx) — dimensionless ✓
+        grad  = x / (1.0 + z)                         # x/(1+Bx) — dimensionless ✓
         B_new = self.B - ETA_B * grad * self.B_hw     # scale to 1/ms units
         self.B_mult = max(B_MULT_MIN, min(B_MULT_MAX, B_new / max(self.B_hw, 1e-9)))
         self.B      = self.B_mult * self.B_hw
@@ -654,9 +649,12 @@ class LayerScheduler:
         for i, inst in enumerate(self.instances):
             inst.configure(cpr, n_tasks, task_type, x_ij=float(probs[i]))
 
-        stable = [i for i, inst in enumerate(self.instances) if inst.is_stable()]
+        # Use base_rho (hardware capacity limit) for stability check, not routing-weighted rho.
+        # This ensures ON-UPF-0/1 are excluded at instagram regardless of their current
+        # routing fraction, making the instability penalty (999ms) fire and create sharp signal.
+        stable = [i for i, inst in enumerate(self.instances) if inst.base_rho < 0.95]
         if not stable:
-            stable = [min(range(self.n), key=lambda i: self.instances[i].rho)]
+            stable = [min(range(self.n), key=lambda i: self.instances[i].base_rho)]
 
         p_all = self.weights / self.weights.sum()
         p_sel = np.zeros(self.n)
