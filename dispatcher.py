@@ -124,7 +124,7 @@ ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
 # ETA_X    drives NF instance weight updates (Level-2 exploration).
 # ETA_B    drives per-instance B_mult updates (Level-2 exploitation).
 _T           = 300                        # nominal horizon = HO_HARD_CAP
-ETA_PATH     = 0.05                      # reduced for Fix 1b: new gradient x/(1+Bx) is ~7x larger than old
+ETA_PATH     = 0.3                       # 6x increase to enable π_ISL oscillation in 30-100 HOs (was 0.05)
 ETA_X        = 0.1 #1.0 / math.sqrt(_T)       # ≈ 0.050
 ETA_B        = 0.01 #0.5  / math.sqrt(_T)     # reduced from 0.1 for Fix 1a
 
@@ -465,11 +465,12 @@ class PathScheduler:
             # ∂L/∂B = x/(1+B·x); safe step size ETA_B_PATH avoids oscillation
             Bx_current = self.B[idx] * x_i
             grad_B = x_i / (1.0 + Bx_current)  # ∂L/∂B, dimensionless
-            ETA_B_PATH = 0.0005  # ~0.00005 per step, reaches equilibrium in ~280 HOs
+            grad_B = min(grad_B, 2.0)  # Cap gradient to prevent collapse on large delays
+            ETA_B_PATH = 0.001   # Conservative: prevents B collapse on large delays
             B_updated = self.B[idx] - ETA_B_PATH * grad_B
 
-            # Blend toward target: slow adaptive learning + stability
-            self.B[idx] = 0.95 * B_target + 0.05 * B_updated
+            # Blend: favor gradient-learned B with strong regularization to target
+            self.B[idx] = 0.8 * B_updated + 0.2 * B_target
 
             # ── Exploration: grad = B/(1+B·x) — inverse-cost weighting ──────────
             Bx   = self.B[idx] * x_i      # dimensionless ✓

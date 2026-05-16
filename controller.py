@@ -92,7 +92,7 @@ HO_ELEVATION_THRESHOLD_DEG = 25.0
 # Algorithm convergence saturates around HO 150–200, so 280 captures the full
 # learning curve with margin and stops cleanly before bad geometry contaminates
 # downstream plots / USRP latency.
-HO_HARD_CAP = 280
+HO_HARD_CAP = 400
 
 # After HO fires, wait for srcSat to rise above this before re-arming
 # (only relevant in real-time mode; accelerated mode uses a timer reset).
