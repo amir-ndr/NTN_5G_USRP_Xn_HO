@@ -7,13 +7,16 @@ Architecture
 Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
 
   Level 1 — PathScheduler (access layer, lives in controller.py):
-      One scheduler PER TASK TYPE — each learns its own π_ISL / π_GND.
-      Gradient signal: x_{i',i} = α(access_cost_i − τ_access)
-      Cost function:   L(x) = log(1 + x)  (B=1 at the path level — no service-rate term)
+      Single shared scheduler across all task types — accumulates all 175 HO updates
+      into one π_ISL / π_GND estimate (vs. ~35 updates per scheduler with per-task dict).
+      Gradient signal: x_i = prop_delay_i  (ms, propagation cost of path i)
+      Cost function:   L(x) = log(1 + B_i · x)  with B_i in 1/ms, updated each HO
       Update rule (positive Bregman multiplicative weights):
-        log_w[i'] += η_path · min(1/(1 + max(x,−0.999)), GRAD_CAP)
-      PathScheduler does NOT call CoreInstance.grad_L(), so the B-factor fix to
-      CoreInstance.grad_L does not affect Level-1 updates.
+        log_w[i] += η_path · min(B_i/(1 + B_i·x_i), GRAD_CAP)
+      B_i is updated via a delay-domain multiplicative step (dimensionally consistent):
+        d_i ← d_i × (1 − η · Bx/(1+Bx)),  then B_i = 1/d_i
+      After each HO, B[0]/B[1] are pushed into trgsat_node.B/tn_node.B so that
+      AccessNode.xn_setup_ms() reflects the algorithm's actual dispatch rate (closed loop).
 
       Regret_access[t] = access_cost_chosen[t] − min(cost_isl[t], cost_gnd[t])
 
@@ -30,10 +33,12 @@ Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
       downstream costs into upstream gradient signals would penalise correct AMF choices
       whenever UPF is overloaded (wrong signal attribution).
 
-      B-parameter update (exploitation arm): B_i = 1/τ_i is derived from fixed hardware
-      specs and never updated. Dynamic CPU reallocation (changing millicores per instance)
-      would constitute the paper's exploitation sub-problem, but requires the paper's
-      exact projected-gradient formula and feasible-set bounds to implement correctly.
+      B-parameter update (exploitation arm): B_i starts at 1/τ_i (hardware service rate)
+      and is updated each HO via exploit_update() using a projected gradient step:
+        B_new = B_i − η_B · (Bx/(1+Bx)) · B_hw,   projected onto [B_MULT_MIN, B_MULT_MAX] · B_hw
+      The B_hw factor is dimensionally necessary (grad is dimensionless; B is in 1/ms).
+      B_mult persists across task-type switches; base_rho at B_mult=1.0 is stored as a
+      fixed oracle reference so the oracle does not drift as the algorithm learns.
 
       Queue state across HOs: G/G/1 steady-state captures queuing within a round.
       HO events are ~5400 simulated seconds apart; queues drain between events, so
@@ -97,13 +102,6 @@ TASK_N_TASKS: dict[str, int] = {
 #   2.0 = extreme load (NTN-AMF-2 also unstable)
 LOAD_SCALE: float = 1.0
 
-# Xn signaling cost per UE — drives the N_r-dependent ρ contribution in AccessNode.
-# Each UE context transfer during an Xn HO requires approximately this many CPU cycles
-# on the Xn processor (context encode + NG interface signaling + auth token check).
-# Combined with the per-node xn_capacity_hz this determines how much extra queueing
-# load N_r adds on top of the sinusoidal bg_load oscillation.
-XN_CYCLES_PER_UE: int = 100_000
-
 # TAU_ACCESS is no longer used by PathScheduler (paper-correct implementation uses
 # Xn G/G/1 service rate directly).  Kept here only for any legacy references.
 TAU_ACCESS   = 42.0
@@ -114,23 +112,33 @@ TAU_ACCESS   = 42.0
 # Values chosen so each instance's expected delay sits near its τ_max at mid-load,
 # giving the LayerScheduler gradient differentiation across load regimes.
 ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
-ETA_X        = 0.05   # Level-2 exploration step (NF instance weight update)
-ETA_B        = 0.02   # Level-2 exploitation step (service-rate B_j update)
-ETA_PATH     = 0.5    # Level-1 (path) Bregman step — large because grad ≈ 0.03–0.05
+
+# Step sizes — calibrated for T = HO_HARD_CAP via η = c/√T theory.
+# ETA_PATH drives path-level Bregman updates (Level-1).
+# ETA_X    drives NF instance weight updates (Level-2 exploration).
+# ETA_B    drives per-instance B_mult updates (Level-2 exploitation).
+_T           = 300                        # nominal horizon = HO_HARD_CAP
+ETA_PATH     = 1.00                       # log_w update; B hits ρ-cap in 1 step anyway
+ETA_X        = 1.0 / math.sqrt(_T)       # ≈ 0.050
+ETA_B        = 0.5  / math.sqrt(_T)      # ≈ 0.025 — was 0.02
+
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
 PROB_FLOOR   = 0.05   # minimum probability per NF instance (exploration floor)
-B_MULT_MIN   = 0.5    # minimum B_mult (50% of hardware baseline)
-B_MULT_MAX   = 2.0    # maximum B_mult (200% of hardware baseline)
+B_MULT_MIN   = 0.7    # minimum B_mult (70% of hardware baseline) — was 0.5
+B_MULT_MAX   = 1.5    # maximum B_mult (150% of hardware baseline) — was 2.0
+
 # Level-1 PathScheduler B parameters.
 # B_i is a SERVICE RATE (1/ms) — NOT a delay.
 # B_i · x_{·,i} = (1/ms) × ms = dimensionless, keeping grad = B/(1+B·x) finite.
-# Storing B as delay (ms) makes B·x ≈ 5×18 = 90 >> 1, collapsing grad to 1/prop.
 #
-# B_PATH_INIT = 0.125 (1/ms): neutral start ≈ 1/8 ms.
-# B_PATH_MAX  = 0.5  (1/ms): safety cap ≈ 1/2 ms; natural ceiling from
-#   delay-domain projection (xns*0.5 ≈ 2–10ms → B ≤ 0.5) makes this rarely active.
-B_PATH_INIT  = 0.125  # initial B_i (1/ms)
-B_PATH_MAX   = 0.5    # upper bound on B_i (1/ms)
+# B_PATH_INIT targets ρ_initial ≈ 0.40–0.50 for both paths:
+#   ISL: xn_base=4 ms → B = 0.10  → ρ = 0.40
+#   GND: xn_base=5 ms → B = 0.10  → ρ = 0.50
+# Stronger B → stronger gradient signal grad = B/(1+Bx); ρ cap at 0.80 prevents blowup.
+B_PATH_INIT  = 0.10   # initial B_i (1/ms) — raised from 0.06 for gradient strength
+B_PATH_MAX   = 0.15   # hard upper bound on B_i — was 0.5 (allowed ρ up to 2.0 via projection)
+RHO_MAX_PATH = 0.80   # ρ cap enforced per-node in the projection step
+RHO_MIN_PATH = 0.10   # ρ floor to keep Bx signal non-negligible
 
 # ── Task types: UPF CPR fallback (used only if instance has no task_cpr dict) ──
 # With per-instance task_cpr, these values are superseded for UPF instances.
@@ -159,37 +167,38 @@ SMF_CYCLES = 500_000    # PDU session establishment: ~5×10^5 cycles
 #  across the full load range (not clamped to the boundary on either extreme).
 # ══════════════════════════════════════════════════════════════════════════════
 
-#  Capacity design rule: every instance must be STABLE (ρ < 0.95) for every task
-#  even at peak bg-load oscillation, so the LayerScheduler has 3 live choices.
-#  Then ranking comes from: (1) raw τ (faster instance = lower base delay),
-#  (2) per-instance background load profile (creates non-stationary crossings),
+#  Capacity design rule: every instance must be STABLE (ρ < 0.95) at B_mult=1.0
+#  for every task, so the LayerScheduler always has 3 live choices to start from.
+#  Ranking differentiation comes from: (1) raw τ (faster instance = lower base delay),
+#  (2) B_mult evolution — the exploitation arm raises B_mult for underloaded instances
+#      and lowers it for overloaded ones, creating non-stationary ρ crossings over time,
 #  (3) variability cs/ca (Kingman variance term differentiates instances).
 #  ON cs/ca higher than GND → satellite NF stack more bursty than data-centre.
 
 _ON_AMF_SPECS = [
-    # cap(MHz): ON-0=1050  ON-1=750  ON-2=600  →  ρ_max(inst=1000, cpr=400k) = 0.38/0.53/0.67
-    # +bg amp (0.20/0.17/0.13) → peak ρ ≤ 0.80 for all   → always stable
+    # cap(MHz): ON-0=1050  ON-1=750  ON-2=600  →  base ρ(inst=1000, cpr=400k) = 0.38/0.53/0.67
+    # All stable at B_mult=1.0; exploitation arm creates load crossings over time.
     ("AMF-ON-0",  700, 1.5, True,  400_000, 1.10, 1.20, 1.5),
     ("AMF-ON-1",  500, 1.5, True,  400_000, 1.25, 1.20, 1.5),
     ("AMF-ON-2",  400, 1.5, True,  400_000, 1.40, 1.20, 1.5),
 ]
 _GND_AMF_SPECS = [
-    # cap(MHz): GND-0=1750  GND-1=1225  GND-2=875  → ρ_max = 0.23/0.33/0.46
-    # +bg amp 0.10–0.15 → peak ρ ≤ 0.62  → always stable, low variance
+    # cap(MHz): GND-0=1750  GND-1=1225  GND-2=875  → base ρ = 0.23/0.33/0.46
+    # All stable at B_mult=1.0; low cs/ca keeps Kingman W_q bounded.
     ("AMF-GND-0", 500, 3.5, False, 400_000, 0.55, 0.70, 0.5),
     ("AMF-GND-1", 350, 3.5, False, 400_000, 0.65, 0.75, 0.5),
     ("AMF-GND-2", 250, 3.5, False, 400_000, 0.75, 0.80, 0.5),
 ]
 _ON_SMF_SPECS = [
-    # cap(MHz): ON-0=1350  ON-1=1050  ON-2=825  → ρ_max(inst=1000, cpr=500k) = 0.37/0.48/0.61
-    # +bg amp 0.15–0.20 → peak ρ ≤ 0.81  → always stable
+    # cap(MHz): ON-0=1350  ON-1=1050  ON-2=825  → base ρ(inst=1000, cpr=500k) = 0.37/0.48/0.61
+    # All stable at B_mult=1.0; exploitation arm creates load crossings over time.
     ("SMF-ON-0",  900, 1.5, True,  500_000, 1.05, 1.15, 1.0),
     ("SMF-ON-1",  700, 1.5, True,  500_000, 1.20, 1.15, 1.0),
     ("SMF-ON-2",  550, 1.5, True,  500_000, 1.35, 1.15, 1.0),
 ]
 _GND_SMF_SPECS = [
-    # cap(MHz): GND-0=2800  GND-1=1750  GND-2=1225  → ρ_max = 0.18/0.29/0.41
-    # +bg amp 0.10–0.15 → peak ρ ≤ 0.56  → always stable
+    # cap(MHz): GND-0=2800  GND-1=1750  GND-2=1225  → base ρ = 0.18/0.29/0.41
+    # All stable at B_mult=1.0; low cs/ca keeps delay variance small.
     ("SMF-GND-0", 800, 3.5, False, 500_000, 0.55, 0.65, 0.3),
     ("SMF-GND-1", 500, 3.5, False, 500_000, 0.65, 0.75, 0.3),
     ("SMF-GND-2", 350, 3.5, False, 500_000, 0.75, 0.80, 0.3),
@@ -243,66 +252,6 @@ _GND_UPF_SPECS = [
     ("UPF-GND-2",  700, 3.5, False, None, 0.75, 0.80, 0.4, _UPF_CPR_GND2),
 ]
 
-# ── Per-instance background load (AMF and SMF only) ───────────────────────────
-# Each NF instance has its own independent oscillating background occupancy.
-# Different periods and phases create genuine crossing points where a smaller
-# instance is temporarily less loaded than a larger one — the ranking flips over
-# time, giving the LayerScheduler a non-trivial learning target.
-# Format: (amplitude, period_in_HOs, phase_offset_radians)
-#   ON  instances: faster oscillations (satellite NF workload bursts quickly)
-#   GND instances: slower, smaller oscillations (stable data-centre environment)
-INSTANCE_LOAD_PROFILES: dict[str, tuple[float, int, float]] = {
-    # Amplitudes tuned so that:
-    #   (a) peak ρ stays below 0.85 even at worst-case task load (stability margin)
-    #   (b) amplitude exceeds the base-ρ gap to neighbouring instance for crossings
-    # Adjacent base-ρ gaps under instagram (worst case):
-    #   AMF-ON: 0.38 → 0.53 → 0.67   gaps≈0.15        bg amp 0.20/0.17/0.13
-    #   SMF-ON: 0.37 → 0.48 → 0.61   gaps≈0.11–0.13   bg amp 0.20/0.17/0.13
-    #   GND   : smaller gaps, smaller amp (data-centre stability)
-    "AMF-ON-0":  (0.20, 40,  0.00),
-    "AMF-ON-1":  (0.17, 55,  0.35),
-    "AMF-ON-2":  (0.13, 70,  0.70),
-    "AMF-GND-0": (0.12, 90,  0.10),
-    "AMF-GND-1": (0.10, 120, 0.55),
-    "AMF-GND-2": (0.08, 80,  0.85),
-    "SMF-ON-0":  (0.20, 45,  0.20),
-    "SMF-ON-1":  (0.17, 60,  0.50),
-    "SMF-ON-2":  (0.13, 75,  0.80),
-    "SMF-GND-0": (0.12, 100, 0.15),
-    "SMF-GND-1": (0.10, 130, 0.60),
-    "SMF-GND-2": (0.08, 85,  0.90),
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Background load functions
-#  TrgSAT: fast oscillation [TRGSAT_BG_TROUGH, TRGSAT_BG_PEAK], period = 120 HOs
-#  TN:     slow oscillation [TN_BG_TROUGH,     TN_BG_PEAK],     period = 300 HOs
-#
-#  TRGSAT_BG_PEAK is the satellite signaling-load peak — an OPERATING CONDITION,
-#  not a system parameter.  Higher peak means heavier concurrent UE signaling on
-#  the onboard Xn processor, which inflates the M/M/1 sojourn 1/(1-ρ) more
-#  aggressively.  Sweep this for paper figures demonstrating algorithm
-#  adaptivity under varying satellite stress.  Default 0.85 = peak traffic.
-# ══════════════════════════════════════════════════════════════════════════════
-
-TRGSAT_BG_TROUGH = 0.20
-TRGSAT_BG_PEAK   = 0.85    # ← OPERATING-CONDITION knob; bg_peak_sweep.py varies this
-TN_BG_TROUGH     = 0.10
-TN_BG_PEAK       = 0.60
-
-
-def trgsat_bg_load(ho_id: int) -> float:
-    phase = (ho_id % 120) / 120.0
-    level = 0.5 + 0.5 * math.sin(2.0 * math.pi * phase)
-    return TRGSAT_BG_TROUGH + (TRGSAT_BG_PEAK - TRGSAT_BG_TROUGH) * level
-
-
-def tn_bg_load(ho_id: int) -> float:
-    phase = (ho_id % 300) / 300.0
-    level = 0.5 + 0.5 * math.sin(2.0 * math.pi * phase)
-    return TN_BG_TROUGH + (TN_BG_PEAK - TN_BG_TROUGH) * level
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  AccessNode — Xn setup latency model
 # ══════════════════════════════════════════════════════════════════════════════
@@ -322,17 +271,18 @@ class AccessNode:
 
     PHASE TRANSITION DESIGN (Level-1 PathScheduler tradeoff)
     ────────────────────────────────────────────────────────
-    The Xn term is the ONLY load-dependent component of access cost. To make the
-    PathScheduler genuinely face a tradeoff we want:
-
-      Low  bg_isl  → access(ISL) < access(GND)   (ISL wins; shorter prop, simpler Xn)
-      High bg_isl  → access(ISL) > access(GND)   (GND wins; ISL Xn queue blows up)
+    ρ for each access node is driven by the PathScheduler's exploitation estimate B:
+        ρ = B × xn_base_ms   (B in 1/ms, τ = xn_base_ms in ms → dimensionless)
+    PathScheduler starts both paths at B_PATH_INIT = 0.125, then updates B via its
+    exploitation arm each HO. After the update, it pushes B[0] → trgsat_node.B and
+    B[1] → tn_node.B, closing the feedback loop: heavier ISL use → higher B_ISL →
+    higher ρ_ISL → xn inflates → gradient weakens → π_ISL falls → equilibrium.
 
     Physics of xn_base_ms (baseline τ = 1/μ — mean service time when queue is empty):
       TrgSAT (ISL, 4.0 ms): onboard satellite Xn processor — LOW capacity, bursty
                             signaling (high c_s, high c_a).  G/G/1 Kingman inflates
-                            fast as bg_load rises AND is amplified by the variance
-                            terms, correctly reflecting satellite Xn unpredictability.
+                            quickly with ρ AND is amplified by the variance terms,
+                            correctly reflecting satellite Xn unpredictability.
       TN     (GND, 5.0 ms): ground core Xn signaling traverses more hops
                             (gNB → AMF → anchor UPF) — HIGHER baseline, but ground
                             servers have stable service (low c_s, low c_a), so the
@@ -344,16 +294,6 @@ class AccessNode:
       For M/M/1: c_a = c_s = 1.0  (Poisson arrivals, exponential service)
       TrgSAT uses c_s=1.2, c_a=1.1 — slightly super-Poisson (bursty onboard CPU)
       TN     uses c_s=0.6, c_a=0.7 — sub-Poisson (deterministic ground processing)
-
-    Crossover (access cost only) is N_r-dependent:
-        Total ρ = bg_load + n_r × XN_CYCLES_PER_UE / xn_capacity_hz
-        At scale=1.0 (instagram, N_r=1000):
-          ISL ρ_nr = 0.05  →  crossover bg_isl* ≈ 0.80  (inside [0.20, 0.85] range)
-        At scale=2.0 (instagram, N_r=2000):
-          ISL ρ_nr = 0.10  →  crossover bg_isl* ≈ 0.72  (more frequent GND preference)
-          At peak bg (0.85) + ρ_nr=0.10 = 0.95  →  ISL Xn UNSTABLE  (strong GND pull)
-        At scale=0.5 (instagram, N_r=500):
-          ISL ρ_nr = 0.025 →  crossover bg_isl* ≈ 0.83  (ISL almost always preferred)
     """
 
     def __init__(self, name: str, ngap_ms: float, xn_base_ms: float,
@@ -365,15 +305,15 @@ class AccessNode:
         self.xn_capacity_hz = xn_capacity_hz
         self.cs             = cs           # CoV of service time  (paper G/G/1 d_i)
         self.ca             = ca           # CoV of inter-arrival time
-        self.bg_load        = 0.30
-        self.n_r            = 0            # updated each HO by controller
+        self.B              = B_PATH_INIT  # dispatch rate (1/ms); updated by PathScheduler
 
     def xn_setup_ms(self) -> float:
         # Full G/G/1 Kingman formula — matches paper Eq. 3 / Algorithm 1 d_i[t].
+        # ρ = B × τ where B is the PathScheduler exploitation estimate for this path.
         # W_q = ρ/(1−ρ) × (c_a² + c_s²)/2 × τ;  d_i = W_q + τ
-        rho_nr    = (self.n_r * XN_CYCLES_PER_UE) / self.xn_capacity_hz
-        rho       = min(self.bg_load + rho_nr, 0.9999)
-        W_q       = (rho / (1.0 - rho)) * ((self.ca**2 + self.cs**2) / 2.0) * self.xn_base_ms
+        # Hard ρ cap at 0.85 ensures Kingman stays finite even under numerical noise.
+        rho = min(self.B * self.xn_base_ms, 0.85)
+        W_q = (rho / (1.0 - rho)) * ((self.ca**2 + self.cs**2) / 2.0) * self.xn_base_ms
         return W_q + self.xn_base_ms
 
     def total_access_cost_ms(self, prop_ms: float) -> float:
@@ -386,7 +326,7 @@ def _inverse_cost_split(cost_isl: float, cost_gnd: float) -> tuple[float, float]
     Instantaneous inverse-cost load-balancing split.
     Returns (p_isl, p_gnd) proportional to 1/cost — the greedy optimum for
     a static cost environment.  The PathScheduler's learned π_ISL/π_GND
-    converges to this split over time as it adapts to the time-varying bg_load.
+    converges to this split over time as the PathScheduler's B values evolve.
     Logged each HO so plots can show the convergence gap.
     """
     w_isl = 1.0 / max(cost_isl, 0.01)
@@ -429,10 +369,9 @@ class PathScheduler:
         d_B  = 1/B_i                  (current delay estimate, ms)
         correction = B_i·x_i/(1+B_i·x_i)          (dimensionless)
         d_new = d_B · (1 − η_path · correction)    (ms × scalar = ms)
-        Project: d_new in [xn_ms/2, xn_ms×2]  (tracks Xn, bounded)
-        B_i = 1/d_new
-        Fast Xn → d_new shrinks → B rises → exploration gradient grows.
-        Slow Xn → d_new grows toward xn_ms → B falls → gradient weakens.
+        Project (ρ-capped): B_i clipped to [RHO_MIN/τ, RHO_MAX/τ] and B_PATH_MAX.
+        Using actual xn_base_ms from access node ensures ρ = B·τ ∈ [0.10, 0.80],
+        preventing Kingman blowup while keeping gradient signal non-negligible.
 
     Both paths update every round (full-information).
     """
@@ -459,13 +398,18 @@ class PathScheduler:
 
     def update(
         self,
-        xn_isl_ms: float, xn_gnd_ms: float,
-        isl_ms:    float, gnd_ms:    float,
+        xn_isl_ms:    float, xn_gnd_ms: float,
+        isl_ms:       float, gnd_ms:    float,
+        trgsat_node: "AccessNode | None" = None,
+        tn_node:     "AccessNode | None" = None,
     ) -> None:
         """
         Full-information update every round.
         xn_isl_ms, xn_gnd_ms: Xn G/G/1 setup delay from AccessNode.xn_setup_ms() (ms).
         isl_ms, gnd_ms:        one-way propagation delay from orbital geometry (ms).
+        trgsat_node, tn_node:  AccessNode objects; after the exploitation step their
+                               .B attribute is set to the updated B_ISL / B_GND so
+                               that ρ = B × τ reflects the algorithm's dispatch rate.
         B in 1/ms (service rate); x in ms (prop delay) → B·x dimensionless.
         """
         props = [isl_ms,    gnd_ms]      # x_{·,i}: prop delay (ms)
@@ -482,13 +426,29 @@ class PathScheduler:
             # ── Exploitation: delay-domain multiplicative step ────────────────
             # Paper: ∇L(B·x)^T·x = Bx/(1+Bx) — dimensionless ∈ [−1, 1).
             # Multiply d_B (not subtract) so units stay ms throughout.
-            correction = Bx / (1.0 + Bx)                              # dimensionless ✓
-            d_B    = 1.0 / max(self.B[idx], 1e-9)                     # current delay (ms)
-            d_new  = d_B * (1.0 - ETA_PATH * correction)              # ms × scalar = ms ✓
-            d_new  = max(xns[idx] * 0.5, min(xns[idx] * 2.0, d_new))  # project
-            self.B[idx] = min(B_PATH_MAX, 1.0 / max(d_new, 1e-9))
+            correction = Bx / (1.0 + Bx)                   # dimensionless ✓
+            d_B    = 1.0 / max(self.B[idx], 1e-9)           # current delay estimate (ms)
+            d_new  = d_B * (1.0 - ETA_PATH * correction)    # ms × scalar = ms ✓
+
+            # ρ-capped projection: use the node's actual service time (xn_base_ms) so
+            # that ρ = B × xn_base_ms stays within [RHO_MIN_PATH, RHO_MAX_PATH].
+            # Falls back to B_PATH_MAX / B_PATH_INIT bounds if node is unavailable.
+            nodes_list = [trgsat_node, tn_node]
+            node_i     = nodes_list[idx]
+            tau_i      = node_i.xn_base_ms if node_i is not None else xns[idx]
+            B_cap      = RHO_MAX_PATH / max(tau_i, 1e-9)    # max B → ρ ≤ RHO_MAX_PATH
+            B_floor    = RHO_MIN_PATH / max(tau_i, 1e-9)    # min B → ρ ≥ RHO_MIN_PATH
+            B_raw      = 1.0 / max(d_new, 1e-9)
+            self.B[idx] = max(B_floor, min(B_cap, min(B_PATH_MAX, B_raw)))
 
         self.log_w -= self.log_w.max()
+
+        # Push updated B values back into the access nodes so ρ = B × τ reflects
+        # the algorithm's actual dispatch rate (closed feedback loop).
+        if trgsat_node is not None:
+            trgsat_node.B = self.B[0]
+        if tn_node is not None:
+            tn_node.B = self.B[1]
 
     def status(self) -> str:
         return (f"π_ISL={self.p_isl:.3f}  π_GND={self.p_gnd:.3f}  "
@@ -527,13 +487,14 @@ class CoreInstance:
         self.tau_max     = tau_max   # per-instance sojourn threshold (ms)
         self.task_cpr    = task_cpr  # per-task CPR dict (UPF only); None → use fixed_cpr/cpr arg
         self.capacity_hz = (millicores / 1000.0) * cpu_freq_ghz * 1e9
-        self.rho    = 0.0
-        self.tau_ms = 1.0
-        self.B_hw   = 1.0   # hardware-derived service rate (reset each round by configure)
-        self.B      = 1.0   # effective service rate = B_mult * B_hw  (used in grad + cost)
-        self.B_mult = 1.0   # PERSISTENT exploitation multiplier — never reset by configure()
+        self.rho      = 0.0
+        self.base_rho = 0.0  # ρ at B_mult=1.0 — stored for fixed oracle computation
+        self.tau_ms   = 1.0
+        self.B_hw     = 1.0  # hardware-derived service rate (reset each round by configure)
+        self.B        = 1.0  # effective service rate = B_mult * B_hw  (used in grad + cost)
+        self.B_mult   = 1.0  # PERSISTENT exploitation multiplier — never reset by configure()
 
-    def configure(self, cpr: int, n_tasks: int, task_type: str = "", ho_id: int = 0) -> None:
+    def configure(self, cpr: int, n_tasks: int, task_type: str = "") -> None:
         # CPR priority: per-instance task dict > fixed_cpr > caller-supplied cpr
         if self.task_cpr and task_type in self.task_cpr:
             effective = self.task_cpr[task_type]
@@ -542,19 +503,14 @@ class CoreInstance:
         else:
             effective = cpr
 
-        self.tau_ms = (effective / self.capacity_hz) * 1000.0
-        base_rho    = (n_tasks * effective) / self.capacity_hz
-
-        # Per-instance background occupancy (AMF/SMF only).
-        # Independent oscillations give each instance a different load trajectory,
-        # so the relative ranking of instances changes over time — creating a
-        # genuine non-stationary learning problem for the LayerScheduler.
-        if self.name in INSTANCE_LOAD_PROFILES:
-            amp, period, phase = INSTANCE_LOAD_PROFILES[self.name]
-            bg = amp * (0.5 + 0.5 * math.sin(2.0 * math.pi * (ho_id / period + phase)))
-            self.rho = min(base_rho + bg, 0.9999)
-        else:
-            self.rho = base_rho
+        self.tau_ms   = (effective / self.capacity_hz) * 1000.0
+        base_rho      = (n_tasks * effective) / self.capacity_hz
+        self.base_rho = base_rho   # ρ at B_mult=1.0; used by oracle to avoid moving target
+        # B_mult (exploitation variable) scales the effective utilization so that
+        # instances the algorithm dispatches to more heavily see higher ρ, closing
+        # the feedback loop: high dispatch rate → high ρ → higher sojourn → gradient
+        # signal weakens → weights redistribute toward less-loaded instances.
+        self.rho = min(self.B_mult * base_rho, 0.9999)
 
         # B_hw is the hardware service rate (1/τ_ms), updated each round as CPR changes.
         # B = B_mult × B_hw is the effective rate used in cost/gradient computation.
@@ -564,7 +520,7 @@ class CoreInstance:
         self.B    = self.B_mult * self.B_hw
 
     def is_stable(self) -> bool:
-        return self.rho < 0.95
+        return self.base_rho < 0.95   # physics-based: B_mult cannot fake stability
 
     def _q_mean_ms(self) -> float:
         rho = min(self.rho, 0.9999)
@@ -581,6 +537,17 @@ class CoreInstance:
     def expected_delay_ms(self) -> float:
         return 999.0 if not self.is_stable() else self._q_mean_ms() + self.tau_ms
 
+    def hw_expected_delay_ms(self) -> float:
+        """Expected delay at hardware baseline (B_mult=1.0) — used for fixed oracle.
+        Oracle must not move as B_mult evolves, otherwise regret shrinks artificially
+        when the algorithm reduces load on overloaded instances.
+        """
+        rho = self.base_rho
+        if rho >= 0.95:
+            return 999.0
+        W_q = (rho / (1.0 - rho)) * ((self.ca**2 + self.cs**2) / 2.0) * self.tau_ms
+        return W_q + self.tau_ms
+
     def x_signal(self, w_ms: float) -> float:
         return ALPHA * (w_ms - self.tau_max)
 
@@ -593,7 +560,8 @@ class CoreInstance:
     def grad_L(self, x: float) -> float:
         # ∂/∂x log(1 + B·x) = B/(1 + B·x)  — B must appear in the numerator.
         # _z already clamps B·x to (-0.999, ∞), so the denominator is always >0.
-        return self.B / (1.0 + self._z(x))
+        # Cap here so the value is bounded even before LayerScheduler clips it.
+        return min(self.B / (1.0 + self._z(x)), GRAD_CAP)
 
     def exploit_update(self, x: float) -> None:
         """
@@ -611,6 +579,8 @@ class CoreInstance:
         B_mult persists across task-type switches (tracks long-run instance quality).
         Projected onto [B_MULT_MIN, B_MULT_MAX] × B_hw.
         """
+        if self.base_rho >= 0.95:   # never update B for physically unstable instances
+            return
         z     = self._z(x)                            # clamp B·x to (-0.999, ∞)
         grad  = z / (1.0 + z)                         # Bx/(1+Bx) — dimensionless ✓
         B_new = self.B - ETA_B * grad * self.B_hw     # scale to 1/ms units
@@ -695,7 +665,6 @@ _CSV_HEADER = [
     "path_p_isl", "path_p_gnd",
     "access_cost_isl", "access_cost_gnd",
     "inv_cost_p_isl", "inv_cost_p_gnd",
-    "trgsat_bg", "tn_bg",
     "amf_inst", "amf_p0", "amf_p1", "amf_p2",
     "amf_ms", "amf_rho", "amf_x", "amf_cost",
     "smf_inst", "smf_p0", "smf_p1", "smf_p2",
@@ -778,27 +747,30 @@ class Dispatcher:
               f"η_path={ETA_PATH}  η_x={ETA_X}  B_PATH_INIT={B_PATH_INIT}  "
               f"τ_max={tau_range} ms (per-instance)  N={n_range} tasks")
 
-    def _configure_all(self, task_type: str, ho_id: int) -> None:
+    def _configure_all(self, task_type: str) -> None:
         n       = int(TASK_N_TASKS[task_type] * LOAD_SCALE)
         upf_cpr = TASK_TYPES[task_type]   # fallback; per-instance task_cpr takes priority
         for inst in self.on_amf.instances + self.gnd_amf.instances:
-            inst.configure(AMF_CYCLES, n, task_type, ho_id)
+            inst.configure(AMF_CYCLES, n, task_type)
         for inst in self.on_smf.instances + self.gnd_smf.instances:
-            inst.configure(SMF_CYCLES, n, task_type, ho_id)
+            inst.configure(SMF_CYCLES, n, task_type)
         for inst in self.on_upf[task_type].instances + self.gnd_upf[task_type].instances:
-            inst.configure(upf_cpr, n, task_type, ho_id)
+            inst.configure(upf_cpr, n, task_type)
 
     def _best_compute_ms(self, path: str, task_type: str) -> float:
-        """Best stable AMF+SMF+UPF compute on the given path (no access overhead)."""
+        """Fixed oracle: best stable AMF+SMF+UPF compute at hardware baseline (B_mult=1.0).
+        Using base_rho for stability and delay ensures the oracle does not move as the
+        algorithm's B_mult values evolve — regret is measured against a fixed benchmark.
+        """
         def best(sched: LayerScheduler) -> float:
-            stable = [inst for inst in sched.instances if inst.is_stable()]
-            return min(inst.expected_delay_ms() for inst in stable) if stable else 999.0
+            stable = [inst for inst in sched.instances if inst.base_rho < 0.95]
+            return min(inst.hw_expected_delay_ms() for inst in stable) if stable else 999.0
         if path == "ISL":
             return best(self.on_amf) + best(self.on_smf) + best(self.on_upf[task_type])
         return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf[task_type])
 
     def expected_compute_ms(self, path: str, task_type: str) -> float:
-        """Expected best-case compute latency for total-cost gradient to PathScheduler."""
+        """Fixed oracle: best stable compute on this path at hardware baseline."""
         return self._best_compute_ms(path, task_type)
 
     def dispatch(
@@ -811,14 +783,23 @@ class Dispatcher:
         path_p_gnd:      float = 0.5,
         access_cost_isl: float = 0.0,
         access_cost_gnd: float = 0.0,
-        trgsat_bg:       float = 0.3,
-        tn_bg:           float = 0.3,
     ) -> tuple[str, dict]:
         self.ho_id += 1
-        self._configure_all(task_type, self.ho_id)
+        self._configure_all(task_type)
 
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
         access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
+
+        # Snapshot ALL scheduler probabilities BEFORE any select_and_process() call.
+        # select_and_process() returns probs_before (pre-update) for the chosen side,
+        # but then updates weights.  Capturing here keeps on_*/gnd_* columns consistent
+        # with amf_p*/smf_p*/upf_p* (all pre-update, same moment in time).
+        on_ap  = self.on_amf.probabilities()
+        on_sp  = self.on_smf.probabilities()
+        on_up  = self.on_upf[task_type].probabilities()
+        gnd_ap = self.gnd_amf.probabilities()
+        gnd_sp = self.gnd_smf.probabilities()
+        gnd_up = self.gnd_upf[task_type].probabilities()
 
         if path == "ISL":
             amf_r = self.on_amf.select_and_process()
@@ -853,13 +834,6 @@ class Dispatcher:
         self.cum_inst_regret   += inst_regret_ms
         self.cum_global_regret += global_regret_ms
 
-        on_ap  = self.on_amf.probabilities()
-        on_sp  = self.on_smf.probabilities()
-        on_up  = self.on_upf[task_type].probabilities()
-        gnd_ap = self.gnd_amf.probabilities()
-        gnd_sp = self.gnd_smf.probabilities()
-        gnd_up = self.gnd_upf[task_type].probabilities()
-
         # B_mult per instance — exploitation learning state
         def bmults(sched: LayerScheduler) -> list[float]:
             return [round(inst.B_mult, 4) for inst in sched.instances]
@@ -888,8 +862,6 @@ class Dispatcher:
             "access_cost_gnd": round(access_cost_gnd, 3),
             "inv_cost_p_isl":  round(ic_p_isl, 4),
             "inv_cost_p_gnd":  round(ic_p_gnd, 4),
-            "trgsat_bg":       round(trgsat_bg, 4),
-            "tn_bg":           round(tn_bg, 4),
             "amf_inst": amf_idx,
             "amf_p0": round(amf_p[0],4), "amf_p1": round(amf_p[1],4), "amf_p2": round(amf_p[2],4),
             "amf_ms": round(amf_ms,3), "amf_rho": round(amf_rho,4),
@@ -963,10 +935,12 @@ class RandomDispatcher:
     def __init__(self, log_dir: str | Path = ".", tag: str = ""):
         self.on_amf  = LayerScheduler([CoreInstance(*p) for p in _ON_AMF_SPECS])
         self.on_smf  = LayerScheduler([CoreInstance(*p) for p in _ON_SMF_SPECS])
-        self.on_upf  = LayerScheduler([CoreInstance(*p) for p in _ON_UPF_SPECS])
+        self.on_upf  = {tt: LayerScheduler([CoreInstance(*p) for p in _ON_UPF_SPECS])
+                        for tt in TASK_TYPES}
         self.gnd_amf = LayerScheduler([CoreInstance(*p) for p in _GND_AMF_SPECS])
         self.gnd_smf = LayerScheduler([CoreInstance(*p) for p in _GND_SMF_SPECS])
-        self.gnd_upf = LayerScheduler([CoreInstance(*p) for p in _GND_UPF_SPECS])
+        self.gnd_upf = {tt: LayerScheduler([CoreInstance(*p) for p in _GND_UPF_SPECS])
+                        for tt in TASK_TYPES}
 
         self.ho_id             = 0
         self.cum_access_regret = 0.0
@@ -982,21 +956,21 @@ class RandomDispatcher:
         print(f"[RandomDispatcher] Random path (50/50) + uniform NF  "
               f"→ {log_dir}/{fname}")
 
-    def _configure_all(self, task_type: str, ho_id: int) -> None:
+    def _configure_all(self, task_type: str) -> None:
         n       = int(TASK_N_TASKS[task_type] * LOAD_SCALE)
         upf_cpr = TASK_TYPES[task_type]
         for inst in self.on_amf.instances + self.gnd_amf.instances:
-            inst.configure(AMF_CYCLES, n, task_type, ho_id)
+            inst.configure(AMF_CYCLES, n, task_type)
         for inst in self.on_smf.instances + self.gnd_smf.instances:
-            inst.configure(SMF_CYCLES, n, task_type, ho_id)
-        for inst in self.on_upf.instances + self.gnd_upf.instances:
-            inst.configure(upf_cpr, n, task_type, ho_id)
+            inst.configure(SMF_CYCLES, n, task_type)
+        for inst in self.on_upf[task_type].instances + self.gnd_upf[task_type].instances:
+            inst.configure(upf_cpr, n, task_type)
 
     def _random_pick(self, sched: LayerScheduler) -> tuple[int, list[float], float, float, float, float]:
         stable = [i for i, inst in enumerate(sched.instances) if inst.is_stable()]
         if not stable:
             stable = [min(range(sched.n), key=lambda i: sched.instances[i].rho)]
-        idx   = stable[int(np.random.randint(len(stable)))]
+        idx   = stable[np.random.randint(0, len(stable))]
         p     = 1.0 / len(stable)
         probs = [round(p, 4) if i in stable else 0.0 for i in range(sched.n)]
         inst  = sched.instances[idx]
@@ -1005,13 +979,13 @@ class RandomDispatcher:
         c_val = inst.cost(x_val)
         return idx, probs, w_ms, x_val, c_val, inst.rho
 
-    def _best_compute_ms(self, path: str) -> float:
+    def _best_compute_ms(self, path: str, task_type: str) -> float:
         def best(sched: LayerScheduler) -> float:
-            stable = [inst for inst in sched.instances if inst.is_stable()]
-            return min(inst.expected_delay_ms() for inst in stable) if stable else 999.0
+            stable = [inst for inst in sched.instances if inst.base_rho < 0.95]
+            return min(inst.hw_expected_delay_ms() for inst in stable) if stable else 999.0
         if path == "ISL":
-            return best(self.on_amf) + best(self.on_smf) + best(self.on_upf)
-        return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf)
+            return best(self.on_amf) + best(self.on_smf) + best(self.on_upf[task_type])
+        return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf[task_type])
 
     def dispatch(
         self,
@@ -1020,11 +994,9 @@ class RandomDispatcher:
         task_type:       str   = "mixed",
         access_cost_isl: float = 0.0,
         access_cost_gnd: float = 0.0,
-        trgsat_bg:       float = 0.3,
-        tn_bg:           float = 0.3,
     ) -> tuple[str, dict]:
         self.ho_id += 1
-        self._configure_all(task_type, self.ho_id)
+        self._configure_all(task_type)
 
         path        = "ISL" if np.random.random() < 0.5 else "GND"
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
@@ -1033,22 +1005,28 @@ class RandomDispatcher:
         if path == "ISL":
             amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._random_pick(self.on_amf)
             smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._random_pick(self.on_smf)
-            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.on_upf)
+            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.on_upf[task_type])
+            on_amf_p  = amf_p;  gnd_amf_p = [1/3]*3
+            on_smf_p  = smf_p;  gnd_smf_p = [1/3]*3
+            on_upf_p  = upf_p;  gnd_upf_p = [1/3]*3
         else:
             amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._random_pick(self.gnd_amf)
             smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._random_pick(self.gnd_smf)
-            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.gnd_upf)
+            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.gnd_upf[task_type])
+            on_amf_p  = [1/3]*3; gnd_amf_p = amf_p
+            on_smf_p  = [1/3]*3; gnd_smf_p = smf_p
+            on_upf_p  = [1/3]*3; gnd_upf_p = upf_p
 
         core_ms  = amf_ms + smf_ms + upf_ms
         total_ms = access_cost + core_ms
 
-        inst_oracle_ms   = self._best_compute_ms(path)
+        inst_oracle_ms   = self._best_compute_ms(path, task_type)
         inst_regret_ms   = max(0.0, core_ms - inst_oracle_ms)
         access_oracle_ms = min(access_cost_isl, access_cost_gnd)
         access_regret_ms = max(0.0, access_cost - access_oracle_ms)
         global_oracle_ms = min(
-            access_cost_isl + self._best_compute_ms("ISL"),
-            access_cost_gnd + self._best_compute_ms("GND"),
+            access_cost_isl + self._best_compute_ms("ISL", task_type),
+            access_cost_gnd + self._best_compute_ms("GND", task_type),
         )
         global_regret_ms = max(0.0, total_ms - global_oracle_ms)
 
@@ -1072,8 +1050,6 @@ class RandomDispatcher:
             "access_cost_gnd": round(access_cost_gnd, 3),
             "inv_cost_p_isl":  round(ic_p_isl, 4),
             "inv_cost_p_gnd":  round(ic_p_gnd, 4),
-            "trgsat_bg":       round(trgsat_bg, 4),
-            "tn_bg":           round(tn_bg, 4),
             "amf_inst": amf_idx,
             "amf_p0": amf_p[0], "amf_p1": amf_p[1], "amf_p2": amf_p[2],
             "amf_ms": round(amf_ms,3), "amf_rho": round(amf_rho,4),
@@ -1088,12 +1064,18 @@ class RandomDispatcher:
             "upf_x": round(upf_x,5), "upf_cost": round(upf_cost,5),
             "core_ms":  round(core_ms,  3),
             "total_ms": round(total_ms, 3),
-            "on_amf_p0":  amf_p[0], "on_amf_p1":  amf_p[1], "on_amf_p2":  amf_p[2],
-            "on_smf_p0":  smf_p[0], "on_smf_p1":  smf_p[1], "on_smf_p2":  smf_p[2],
-            "on_upf_p0":  upf_p[0], "on_upf_p1":  upf_p[1], "on_upf_p2":  upf_p[2],
-            "gnd_amf_p0": amf_p[0], "gnd_amf_p1": amf_p[1], "gnd_amf_p2": amf_p[2],
-            "gnd_smf_p0": smf_p[0], "gnd_smf_p1": smf_p[1], "gnd_smf_p2": smf_p[2],
-            "gnd_upf_p0": upf_p[0], "gnd_upf_p1": upf_p[1], "gnd_upf_p2": upf_p[2],
+            "on_amf_p0":  on_amf_p[0],  "on_amf_p1":  on_amf_p[1],  "on_amf_p2":  on_amf_p[2],
+            "on_smf_p0":  on_smf_p[0],  "on_smf_p1":  on_smf_p[1],  "on_smf_p2":  on_smf_p[2],
+            "on_upf_p0":  on_upf_p[0],  "on_upf_p1":  on_upf_p[1],  "on_upf_p2":  on_upf_p[2],
+            "gnd_amf_p0": gnd_amf_p[0], "gnd_amf_p1": gnd_amf_p[1], "gnd_amf_p2": gnd_amf_p[2],
+            "gnd_smf_p0": gnd_smf_p[0], "gnd_smf_p1": gnd_smf_p[1], "gnd_smf_p2": gnd_smf_p[2],
+            "gnd_upf_p0": gnd_upf_p[0], "gnd_upf_p1": gnd_upf_p[1], "gnd_upf_p2": gnd_upf_p[2],
+            "on_amf_B0":  1.0, "on_amf_B1":  1.0, "on_amf_B2":  1.0,
+            "on_smf_B0":  1.0, "on_smf_B1":  1.0, "on_smf_B2":  1.0,
+            "on_upf_B0":  1.0, "on_upf_B1":  1.0, "on_upf_B2":  1.0,
+            "gnd_amf_B0": 1.0, "gnd_amf_B1": 1.0, "gnd_amf_B2": 1.0,
+            "gnd_smf_B0": 1.0, "gnd_smf_B1": 1.0, "gnd_smf_B2": 1.0,
+            "gnd_upf_B0": 1.0, "gnd_upf_B1": 1.0, "gnd_upf_B2": 1.0,
             "global_oracle_ms":     round(global_oracle_ms,    3),
             "access_regret_ms":     round(access_regret_ms,    3),
             "inst_regret_ms":       round(inst_regret_ms,      3),

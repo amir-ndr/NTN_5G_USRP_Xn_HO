@@ -57,7 +57,6 @@ from orbit import OrbitalEngine
 from dispatcher import (
     Dispatcher, RandomDispatcher,
     AccessNode, PathScheduler,
-    trgsat_bg_load, tn_bg_load,
     TASK_CYCLE,
 )
 
@@ -134,12 +133,13 @@ NE_ONE_PASS     = ""               # HTTP Basic auth password (leave "" if none)
 #   task exactly N_total/5 HOs — reproducible across seeds and easier to justify
 #   in the paper: "traffic classes are cycled in randomised order ensuring equal
 #   learning opportunities per task type."
-MIN_TASK_HOS = 15   # HOs per task block (kept same as before)
+MIN_TASK_HOS = 30   # HOs per task block — longer blocks let each per-task scheduler
+                    # accumulate more consecutive updates before switching
 
 # Build a shuffled rotation long enough for HO_HARD_CAP.
 # TASK_CYCLE = ["gaming","youtube","browsing","instagram","mixed"] (5 types).
-# With MIN_TASK_HOS=15 and HO_HARD_CAP=280: need ceil(280/15)=19 blocks → 4
-# full repetitions of TASK_CYCLE gives 20 blocks.  Shuffle for random order.
+# With MIN_TASK_HOS=30 and HO_HARD_CAP=280: need ceil(280/30)=10 blocks → 2
+# full repetitions of TASK_CYCLE gives 10 blocks.  Shuffle for random order.
 _rotation_base = (TASK_CYCLE * ((HO_HARD_CAP // (MIN_TASK_HOS * len(TASK_CYCLE))) + 1))
 random.shuffle(_rotation_base)
 TASK_ROTATION: list[str] = _rotation_base
@@ -173,18 +173,36 @@ TASK_ROTATION: list[str] = _rotation_base
 #   default — calibrated near median sojourn: best differentiation
 #   relaxed — loose thresholds (≈ 3× default): most delays below τ_max
 #             → gradients saturate → near-uniform instance weights
-TAU_PROFILES: dict[str, dict[str, float]] = {
+# TAU_PROFILES: dict[str, dict[str, float]] = {
+#     "strict": {
+#         "ON_AMF":  0.70, "ON_SMF":  0.50, "ON_UPF":  1.00,
+#         "GND_AMF": 0.25, "GND_SMF": 0.15, "GND_UPF": 0.20,
+#     },
+#     "default": {
+#         "ON_AMF":  1.50, "ON_SMF":  1.00, "ON_UPF":  3.50,
+#         "GND_AMF": 0.50, "GND_SMF": 0.30, "GND_UPF": 0.15,
+#     },
+#     "relaxed": {
+#         "ON_AMF":  4.00, "ON_SMF":  3.00, "ON_UPF":  6.00,
+#         "GND_AMF": 1.50, "GND_SMF": 1.00, "GND_UPF": 1.50,
+#     },
+# }
+
+TAU_PROFILES = {
     "strict": {
-        "ON_AMF":  0.70, "ON_SMF":  0.50, "ON_UPF":  1.00,
-        "GND_AMF": 0.25, "GND_SMF": 0.15, "GND_UPF": 0.20,
+        # ≈ 0.5× expected sojourn at mid-load
+        "ON_AMF":  0.30, "ON_SMF":  0.28, "ON_UPF":  1.50,
+        "GND_AMF": 0.15, "GND_SMF": 0.10, "GND_UPF": 0.08,
     },
     "default": {
-        "ON_AMF":  1.50, "ON_SMF":  1.00, "ON_UPF":  3.50,
-        "GND_AMF": 0.50, "GND_SMF": 0.30, "GND_UPF": 0.15,
+        # ≈ expected sojourn at mid-load (x crosses zero cleanly)
+        "ON_AMF":  0.60, "ON_SMF":  0.55, "ON_UPF":  3.00,
+        "GND_AMF": 0.35, "GND_SMF": 0.33, "GND_UPF": 0.25,
     },
     "relaxed": {
-        "ON_AMF":  4.00, "ON_SMF":  3.00, "ON_UPF":  6.00,
-        "GND_AMF": 1.50, "GND_SMF": 1.00, "GND_UPF": 1.50,
+        # ≈ 2× expected sojourn at mid-load
+        "ON_AMF":  1.50, "ON_SMF":  1.10, "ON_UPF":  7.00,
+        "GND_AMF": 0.80, "GND_SMF": 0.60, "GND_UPF": 0.40,
     },
 }
 
@@ -389,13 +407,13 @@ def _trigger_handover(
     trgsat_node:      AccessNode,
     tn_node:          AccessNode,
     task_type:        str,
-    path_schedulers:  "dict[str, PathScheduler]",
+    path_scheduler:   "PathScheduler",
     rand_dispatcher:  "RandomDispatcher | None" = None,
 ) -> bool:
     """
     Execute an Xn handover via two-level Bregman learning:
       1. Compute access costs for both paths
-      2. Level-1: per-task-type PathScheduler samples path (Bregman mirror descent)
+      2. Level-1: per-task PathScheduler samples path (Bregman mirror descent)
       3. Level-2: Dispatcher selects AMF/SMF/UPF instances (Bregman)
       4. PathScheduler updated with BOTH access costs (full-information Bregman)
       5. RandomDispatcher: 50/50 random path + uniform NF (baseline)
@@ -405,12 +423,6 @@ def _trigger_handover(
     """
     isl_ms = state.isl_delay_ms
     gnd_ms = state.sat_gnd_delay_ms
-
-    # Sync N_r onto both access nodes so xn_setup_ms() reflects current task load.
-    import dispatcher as _dm
-    _n_r = int(_dm.TASK_N_TASKS[task_type] * _dm.LOAD_SCALE)
-    trgsat_node.n_r = _n_r
-    tn_node.n_r     = _n_r
 
     # ── Physical bounds guard — reject SGP4 garbage from TLE epoch overflow ──
     # LEO ISL physical max ≈ 8.3 ms (2500 km); LEO-GND physical max ≈ 3.7 ms (1123 km).
@@ -431,7 +443,7 @@ def _trigger_handover(
     cost_isl = trgsat_node.total_access_cost_ms(isl_ms)
     cost_gnd = tn_node.total_access_cost_ms(gnd_ms)
 
-    sched = path_schedulers[task_type]
+    sched = path_scheduler
     path  = sched.sample()
 
     # ── Level-2: Bregman NF instance selection ────────────────────────────────
@@ -444,15 +456,12 @@ def _trigger_handover(
         path_p_gnd      = sched.p_gnd,
         access_cost_isl = cost_isl,
         access_cost_gnd = cost_gnd,
-        trgsat_bg       = trgsat_node.bg_load,
-        tn_bg           = tn_node.bg_load,
     )
 
-    # Paper Algorithm 1 — Level-1 PathScheduler update:
-    #   Exploration arm uses current routing probability p_i.
-    #   Exploitation arm uses Xn G/G/1 service rate 1/xn_ms_i.
-    #   No TAU_ACCESS threshold — B_i naturally encodes Xn congestion.
-    sched.update(trgsat_node.xn_setup_ms(), tn_node.xn_setup_ms(), isl_ms, gnd_ms)
+    # Paper Algorithm 1 — Level-1 PathScheduler update (full-information).
+    # x_{·,i} = propagation delay (paper definition); Xn sojourn used for exploitation B.
+    sched.update(trgsat_node.xn_setup_ms(), tn_node.xn_setup_ms(), isl_ms, gnd_ms,
+                 trgsat_node, tn_node)
 
     # ── Random baseline: 50/50 path + uniform NF (independent of Bregman) ────
     if rand_dispatcher is not None:
@@ -462,8 +471,6 @@ def _trigger_handover(
             task_type       = task_type,
             access_cost_isl = cost_isl,
             access_cost_gnd = cost_gnd,
-            trgsat_bg       = trgsat_node.bg_load,
-            tn_bg           = tn_node.bg_load,
         )
 
     new_dest = "trgSAT" if path == "ISL" else "TN"
@@ -486,12 +493,12 @@ def _trigger_handover(
           f"(below threshold {min_el}°)")
     print(f"  UE→tgtSat ({state.tgt_name}) elevation = {state.ue_tgt_elevation_deg:.1f}°")
     print(f"  Prop delay : ISL={isl_ms:.2f} ms  |  GND={gnd_ms:.2f} ms")
-    print(f"  TrgSAT bg={trgsat_node.bg_load:.2f}  "
+    print(f"  TrgSAT ρ={trgsat_node.B*trgsat_node.xn_base_ms:.3f}  "
           f"prop={isl_ms:.2f} ms  xn={trgsat_node.xn_setup_ms():.2f} ms  "
-          f"B_ISL={sched.B[0]:.4f}  →  π_ISL[{task_type}]={sched.p_isl:.3f}")
-    print(f"  TN     bg={tn_node.bg_load:.2f}  "
+          f"B_ISL={sched.B[0]:.4f}  →  π_ISL={sched.p_isl:.3f}")
+    print(f"  TN     ρ={tn_node.B*tn_node.xn_base_ms:.3f}  "
           f"prop={gnd_ms:.2f} ms  xn={tn_node.xn_setup_ms():.2f} ms  "
-          f"B_GND={sched.B[1]:.4f}  →  π_GND[{task_type}]={sched.p_gnd:.3f}")
+          f"B_GND={sched.B[1]:.4f}  →  π_GND={sched.p_gnd:.3f}")
     print(f"  Path selected  : {path}")
     print(f"  Core delay : AMF={info['amf_ms']:.2f} ms  SMF={info['smf_ms']:.2f} ms  "
           f"UPF={info['upf_ms']:.2f} ms  →  total={info['total_ms']:.2f} ms")
@@ -631,21 +638,22 @@ def main():
 
     dispatcher      = Dispatcher(log_dir=run_dir, tag=run_tag)
     rand_dispatcher = RandomDispatcher(log_dir=run_dir, tag=run_tag)
-    # One PathScheduler per task type — each learns its own π_ISL / π_GND
-    path_schedulers: dict[str, PathScheduler] = {tt: PathScheduler() for tt in TASK_CYCLE}
+    # Single shared PathScheduler — all task types contribute to the same π_ISL / π_GND
+    # (175 total HOs feed one scheduler vs 35/scheduler with per-task dict)
+    path_scheduler = PathScheduler()
 
     # ── Access nodes (srcSAT decides path based on Xn setup cost) ────────────
     # Full G/G/1 Kingman used for d_i[t] (paper Eq. 3 / Algorithm 1 Eq. 11).
     # TrgSAT (ISL): xn_base=4.0 ms τ, xn_capacity=2 GHz onboard processor.
-    #               bg_load ∈ [0.20, 0.85] + N_r×100k/2GHz.
+    #               ρ = B_ISL × 4.0 ms (driven by PathScheduler exploitation).
     #               cs=1.2, ca=1.1: bursty onboard CPU — super-Poisson variance
     #               amplifies Kingman W_q even at moderate ρ, reflecting NTN
-    #               Xn unpredictability.  At scale=2.0 peak ρ≈0.95 → UNSTABLE.
+    #               Xn unpredictability.
     # TN     (GND): xn_base=5.0 ms τ, xn_capacity=8 GHz ground server.
-    #               bg_load ∈ [0.10, 0.60] + much smaller N_r component.
+    #               ρ = B_GND × 5.0 ms (driven by PathScheduler exploitation).
     #               cs=0.6, ca=0.7: near-deterministic ground processing — variance
     #               multiplier (c_a²+c_s²)/2 ≈ 0.425 keeps d_i bounded vs TrgSAT's
-    #               ≈ 1.325.  Crossover bg_isl* is N_r-dependent: ≈0.80 at scale=1.0.
+    #               ≈ 1.325.
     trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=4.0,
                              xn_capacity_hz=2e9, cs=1.2, ca=1.1)
     tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=5.0,
@@ -761,24 +769,8 @@ def main():
             if reset_interval_s:
                 ho_reset_at = now_real + reset_interval_s
 
-            # Update background loads for this HO.
-            trgsat_node.bg_load = trgsat_bg_load(ho_count)
-            tn_node.bg_load     = tn_bg_load(ho_count)
             ho_count       += 1
             task_ho_count  += 1
-
-            # ── Hard cap: stop cleanly before TLE epoch overflow corrupts data ──
-            if ho_count >= HO_HARD_CAP:
-                print(f"\n{'='*80}")
-                print(f"  [HO HARD CAP REACHED]  {ho_count} handovers completed.")
-                print(f"  Algorithm has fully converged (saturates around HO ~150-200).")
-                print(f"  Stopping cleanly before SGP4 garbage from stale TLE epoch.")
-                print(f"  Refresh starlink.tle to extend the simulation window.")
-                print(f"{'='*80}\n", flush=True)
-                running = False
-                dispatcher.close()
-                rand_dispatcher.close()
-                break
 
             # Rotation task switching: after MIN_TASK_HOS HOs advance to the
             # next slot in the pre-shuffled TASK_ROTATION.  Every task type
@@ -794,7 +786,19 @@ def main():
 
             _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG,
                               dispatcher, trgsat_node, tn_node, task_type,
-                              path_schedulers, rand_dispatcher)
+                              path_scheduler, rand_dispatcher)
+
+            # ── Hard cap: stop after HO_HARD_CAP dispatches (cap is inclusive) ─
+            if ho_count >= HO_HARD_CAP:
+                print(f"\n{'='*80}")
+                print(f"  [HO HARD CAP REACHED]  {ho_count} handovers completed.")
+                print(f"  Stopping cleanly before SGP4 garbage from stale TLE epoch.")
+                print(f"  Refresh starlink.tle to extend the simulation window.")
+                print(f"{'='*80}\n", flush=True)
+                running = False
+                dispatcher.close()
+                rand_dispatcher.close()
+                break
 
             # Recompute state with the new pair for accurate display
             state = engine.state(unix_time=sim_time)
