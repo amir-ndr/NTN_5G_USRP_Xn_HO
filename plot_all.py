@@ -122,6 +122,50 @@ def _annotate_task_switches(ax, df: pd.DataFrame) -> None:
         ax.axvline(df["ho_id"].iloc[i], color="black", lw=0.4, alpha=0.25)
 
 
+def _add_task_background(ax, df: pd.DataFrame) -> None:
+    """Add task-type background shading with labels on top."""
+    if "task_type" not in df.columns:
+        return
+
+    task_types = df["task_type"].tolist()
+    ho_ids = df["ho_id"].to_numpy()
+
+    if not task_types:
+        return
+
+    # Build task blocks
+    blocks = []
+    prev_tt = task_types[0]
+    start_x = ho_ids[0]
+
+    for i in range(1, len(ho_ids)):
+        if task_types[i] != prev_tt:
+            blocks.append((start_x, ho_ids[i - 1], prev_tt))
+            start_x = ho_ids[i]
+            prev_tt = task_types[i]
+    blocks.append((start_x, ho_ids[-1], prev_tt))
+
+    # Draw blocks
+    task_short = {"gaming": "GAM", "youtube": "YT", "browsing": "BR",
+                  "instagram": "IG", "mixed": "MX"}
+    task_colors = {"gaming": "#BBDEFB", "youtube": "#FFCDD2", "browsing": "#C8E6C9",
+                   "instagram": "#FFE0B2", "mixed": "#E1BEE7"}
+
+    ymin, ymax = ax.get_ylim()
+    for x0, x1, tt in blocks:
+        ax.axvspan(float(x0) - 0.5, float(x1) + 0.5,
+                   alpha=0.08, color=task_colors.get(tt, "#F5F5F5"), zorder=0)
+
+    # Add labels on top
+    for x0, x1, tt in blocks:
+        mid = (float(x0) + float(x1)) / 2
+        ax.text(mid, 0.98, task_short.get(tt, tt[:3].upper()),
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=9, fontweight="bold",
+                color="#333333", bbox=dict(boxstyle="round,pad=0.3",
+                facecolor="white", alpha=0.7, edgecolor="none"))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Experiment 1 — Regret Convergence
 # ══════════════════════════════════════════════════════════════════════════════
@@ -610,6 +654,111 @@ def exp7_baselines(out: Path) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Selection Timeline Plots — Path and Instance Selection per Task Type
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_selections(tau: str, ls: float, out: Path) -> None:
+    """
+    Create multi-panel figure showing path and instance selections with task types.
+    Panels:
+      1. Path selection (ISL vs GND) timeline with π_ISL overlay
+      2. AMF instance selection per HO
+      3. SMF instance selection per HO
+      4. UPF instance selection per HO
+    All with task-type background shading and labels.
+    """
+    df = _load(tau, ls, "dispatch_log")
+    if df is None:
+        return
+
+    ho_ids = df["ho_id"].to_numpy()
+    path = df["path"].to_numpy()
+    p_isl = df["path_p_isl"].to_numpy()
+
+    # Instance selection: extract which instance (0, 1, or 2) was chosen
+    amf_inst = df["amf_inst"].to_numpy().astype(int)
+    smf_inst = df["smf_inst"].to_numpy().astype(int)
+    upf_inst = df["upf_inst"].to_numpy().astype(int)
+
+    # Create 2×2 figure
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"Selection Timelines  (τ={tau}, load={ls})",
+                 fontsize=14, fontweight="bold", y=0.995)
+
+    # Panel 1: Path selection with π_ISL overlay
+    ax = axes[0, 0]
+    path_y = (path == "ISL").astype(int)
+    ax.scatter(ho_ids, path_y, c=path_y, cmap="RdBu_r", s=20, alpha=0.6, zorder=3)
+    ax2 = ax.twinx()
+    ax2.plot(ho_ids, p_isl, color="#2196F3", lw=2, label="π_ISL", zorder=4)
+    ax2.axhline(0.5, color="gray", lw=1, linestyle="--", alpha=0.3)
+    ax.set_ylabel("Path selected (1=ISL, 0=GND)")
+    ax2.set_ylabel("π_ISL", color="#2196F3")
+    ax2.tick_params(axis='y', labelcolor="#2196F3")
+    ax2.legend(loc="upper left")
+    ax.set_ylim(-0.1, 1.1)
+    ax2.set_ylim(0, 1)
+    ax.set_title("1. Path Selection Timeline")
+    _add_task_background(ax, df)
+    ax.grid(True, alpha=0.2)
+
+    # Panel 2: AMF instance selection
+    ax = axes[0, 1]
+    colors_inst = ["#1565C0", "#EF6C00", "#2E7D32"]
+    inst_names = ["ON-0", "ON-1/2", "GND"]
+    for i in range(3):
+        mask = amf_inst == i
+        ax.scatter(ho_ids[mask], amf_inst[mask], c=colors_inst[i], s=30, alpha=0.7,
+                   label=inst_names[i], zorder=3)
+    ax.set_ylabel("AMF Instance")
+    ax.set_ylim(-0.5, 2.5)
+    ax.set_yticks([0, 1, 2])
+    ax.set_yticklabels(inst_names)
+    ax.set_title("2. AMF Instance Selection")
+    _add_task_background(ax, df)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.2, axis='y')
+
+    # Panel 3: SMF instance selection
+    ax = axes[1, 0]
+    for i in range(3):
+        mask = smf_inst == i
+        ax.scatter(ho_ids[mask], smf_inst[mask], c=colors_inst[i], s=30, alpha=0.7,
+                   label=inst_names[i], zorder=3)
+    ax.set_ylabel("SMF Instance")
+    ax.set_ylim(-0.5, 2.5)
+    ax.set_yticks([0, 1, 2])
+    ax.set_yticklabels(inst_names)
+    ax.set_xlabel("Handover index")
+    ax.set_title("3. SMF Instance Selection")
+    _add_task_background(ax, df)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.2, axis='y')
+
+    # Panel 4: UPF instance selection
+    ax = axes[1, 1]
+    for i in range(3):
+        mask = upf_inst == i
+        ax.scatter(ho_ids[mask], upf_inst[mask], c=colors_inst[i], s=30, alpha=0.7,
+                   label=inst_names[i], zorder=3)
+    ax.set_ylabel("UPF Instance")
+    ax.set_ylim(-0.5, 2.5)
+    ax.set_yticks([0, 1, 2])
+    ax.set_yticklabels(inst_names)
+    ax.set_xlabel("Handover index")
+    ax.set_title("4. UPF Instance Selection")
+    _add_task_background(ax, df)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.2, axis='y')
+
+    fig.tight_layout()
+    fname = f"selections_{tau}_ls{_ls_tag(ls)}.png"
+    fig.savefig(out / fname, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"    → {fname}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -629,6 +778,8 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--exp", type=int, nargs="*", default=list(EXPERIMENTS),
                    metavar="N", help="experiment numbers to run (default: all)")
+    p.add_argument("--selections", action="store_true",
+                   help="also generate selection timeline plots for all tau/load combos")
     args = p.parse_args()
 
     OUT_DIR.mkdir(exist_ok=True)
@@ -640,6 +791,23 @@ def main() -> None:
         sub.mkdir(exist_ok=True)
         print(f"\n══ Experiment {n} ══  → {sub.relative_to(HERE)}/")
         EXPERIMENTS[n](sub)
+
+    # Generate selection timeline plots for all tau/load combinations
+    if args.selections:
+        print(f"\n══ Selection Timelines ══")
+        selections_dir = OUT_DIR / "selections"
+        selections_dir.mkdir(exist_ok=True)
+
+        tau_profiles = ["strict", "default", "relaxed"]
+        load_scales = [0.5, 1.0, 1.5, 2.0]
+
+        for tau in tau_profiles:
+            for ls in load_scales:
+                print(f"  {tau} + load={ls}...", end=" ", flush=True)
+                try:
+                    plot_selections(tau, ls, selections_dir)
+                except Exception as e:
+                    print(f"error: {e}", file=sys.stderr)
 
     print(f"\nAll plots written under: {OUT_DIR.relative_to(HERE)}/")
 
