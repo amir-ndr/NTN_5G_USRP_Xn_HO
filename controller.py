@@ -457,12 +457,15 @@ def _trigger_handover(
         path_p_gnd      = sched.p_gnd,
         access_cost_isl = cost_isl,
         access_cost_gnd = cost_gnd,
+        trgsat_node     = trgsat_node,
+        tn_node         = tn_node,
     )
 
     # Paper Algorithm 1 — Level-1 PathScheduler update (full-information).
     # x_{·,i} = propagation delay (paper definition); Xn sojourn used for exploitation B.
+    # chosen_path drives γ_i for the dynamic projection bound on B_i (Step 1b).
     sched.update(trgsat_node.xn_setup_ms(), tn_node.xn_setup_ms(), isl_ms, gnd_ms,
-                 trgsat_node, tn_node)
+                 trgsat_node, tn_node, chosen_path=path)
 
     # ── Random baseline: 50/50 path + uniform NF (independent of Bregman) ────
     if rand_dispatcher is not None:
@@ -472,6 +475,8 @@ def _trigger_handover(
             task_type       = task_type,
             access_cost_isl = cost_isl,
             access_cost_gnd = cost_gnd,
+            trgsat_node     = trgsat_node,
+            tn_node         = tn_node,
         )
 
     # ── Greedy oracle: perfect-info single-instance choice (upper bound on learning) ──
@@ -482,6 +487,8 @@ def _trigger_handover(
             task_type       = task_type,
             access_cost_isl = cost_isl,
             access_cost_gnd = cost_gnd,
+            trgsat_node     = trgsat_node,
+            tn_node         = tn_node,
         )
 
     new_dest = "trgSAT" if path == "ISL" else "TN"
@@ -506,10 +513,12 @@ def _trigger_handover(
     print(f"  Prop delay : ISL={isl_ms:.2f} ms  |  GND={gnd_ms:.2f} ms")
     print(f"  TrgSAT ρ={trgsat_node.B*trgsat_node.xn_base_ms:.3f}  "
           f"prop={isl_ms:.2f} ms  xn={trgsat_node.xn_setup_ms():.2f} ms  "
-          f"B_ISL={sched.B[0]:.4f}  →  π_ISL={sched.p_isl:.3f}")
+          f"B_ISL={sched.B[0]:.4f}  Q_ISL={trgsat_node.Q:.4f}  γ_ISL={trgsat_node.gamma:.4f}  "
+          f"→  π_ISL={sched.p_isl:.3f}")
     print(f"  TN     ρ={tn_node.B*tn_node.xn_base_ms:.3f}  "
           f"prop={gnd_ms:.2f} ms  xn={tn_node.xn_setup_ms():.2f} ms  "
-          f"B_GND={sched.B[1]:.4f}  →  π_GND={sched.p_gnd:.3f}")
+          f"B_GND={sched.B[1]:.4f}  Q_GND={tn_node.Q:.4f}  γ_GND={tn_node.gamma:.4f}  "
+          f"→  π_GND={sched.p_gnd:.3f}")
     print(f"  Path selected  : {path}")
     print(f"  Core delay : AMF={info['amf_ms']:.2f} ms  SMF={info['smf_ms']:.2f} ms  "
           f"UPF={info['upf_ms']:.2f} ms  →  total={info['total_ms']:.2f} ms")

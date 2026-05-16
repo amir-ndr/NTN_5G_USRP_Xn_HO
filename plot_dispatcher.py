@@ -32,20 +32,28 @@ from pathlib import Path
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 
 _HERE     = Path(__file__).resolve().parent
 LOG_CSV   = _HERE / "results/default_ls1/dispatch_log_default_ls1.csv"
 RAND_CSV  = _HERE / "results/default_ls1/random_log_default_ls1.csv"
-OUT_PNG   = _HERE / "results/default_ls1/results_dispatcher_ls1.png"
-DEBUG_PNG = _HERE / "results/default_ls1/debug_instagram.png"
+OUT_PNG    = _HERE / "results/default_ls1/results_dispatcher_ls1.png"
+DEBUG_PNG  = _HERE / "results/default_ls1/debug_instagram.png"
+LEVEL1_PNG = _HERE / "results/default_ls1/level1_dynamics_ls1.png"
 
 CLIP_MS        = 70.0    # y-axis display clip for delay panels
 OUTLIER_THRESH = 150.0   # exclude from per-task latency averages
 
-# B_mult bounds (must match dispatcher.py)
+# B_mult bounds (Level-2; must match dispatcher.py)
 B_MULT_MIN = 0.7
 B_MULT_MAX = 1.5
+
+# Level-1 PathScheduler bounds (must match dispatcher.py)
+B_PATH_MAX   = 0.20
+RHO_MIN_PATH = 0.02
+TAU_ISL_MS   = 4.0   # trgSAT xn_base_ms
+TAU_GND_MS   = 5.0   # TN     xn_base_ms
 
 C_ISL   = "#2196F3"
 C_GND   = "#FF5722"
@@ -282,6 +290,118 @@ def save_debug_instagram(
     plt.tight_layout()
     fig.savefig(DEBUG_PNG, dpi=150, bbox_inches="tight")
     print(f"[debug] Saved → {DEBUG_PNG}")
+    plt.close(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Level-1 PathScheduler dynamics figure (paper Algorithm 1 visualisation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_level1_dynamics(
+    rows: list[dict], ho_ids: np.ndarray, task_types: list[str]
+) -> None:
+    """Visualise the paper's dynamic projection bound on B_i (Algorithm 1, Step 1b):
+        B_i[t+1] ∈ [0, min{B_max, Q_i[t] + γ_i[t]}]
+    Panels:
+      1. B_ISL, B_GND  with B_PATH_MAX and per-path B_floor reference lines.
+      2. Q_ISL, Q_GND  (paper Eq. 1 backlog evolution).
+      3. Dynamic projection cap min{B_PATH_MAX, Q+γ} vs actual B per path —
+         shows which constraint binds round-by-round.
+      4. π_ISL trajectory with chosen-path scatter — does Level-1 learn anything
+         beyond geometry?
+    """
+    required = ("B_isl", "B_gnd", "Q_isl", "Q_gnd", "gamma_isl", "gamma_gnd")
+    if not rows or any(col not in rows[0] for col in required):
+        missing = [c for c in required if not rows or c not in rows[0]]
+        print(f"[level1] dispatch_log missing columns {missing} — re-run "
+              f"controller.py to populate fresh CSVs.")
+        return
+
+    B_isl = np.array([fv(r, "B_isl")     for r in rows])
+    B_gnd = np.array([fv(r, "B_gnd")     for r in rows])
+    Q_isl = np.array([fv(r, "Q_isl")     for r in rows])
+    Q_gnd = np.array([fv(r, "Q_gnd")     for r in rows])
+    g_isl = np.array([fv(r, "gamma_isl") for r in rows])
+    g_gnd = np.array([fv(r, "gamma_gnd") for r in rows])
+    p_isl = np.array([fv(r, "path_p_isl") for r in rows])
+    paths = [r.get("path", "") for r in rows]
+
+    B_floor_isl = RHO_MIN_PATH / TAU_ISL_MS
+    B_floor_gnd = RHO_MIN_PATH / TAU_GND_MS
+    cap_isl     = np.minimum(B_PATH_MAX, Q_isl + g_isl)
+    cap_gnd     = np.minimum(B_PATH_MAX, Q_gnd + g_gnd)
+
+    fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
+    fig.suptitle("Level-1 PathScheduler Dynamics  (Algorithm 1, Step 1b)",
+                 fontsize=14, fontweight="bold", y=0.995)
+
+    # ── 1. B trajectories ────────────────────────────────────────────────────
+    ax = axes[0]
+    add_task_shading(ax, ho_ids, task_types)
+    ax.plot(ho_ids, B_isl, color=C_ISL, lw=1.4, label=r"$B_{ISL}$")
+    ax.plot(ho_ids, B_gnd, color=C_GND, lw=1.4, label=r"$B_{GND}$")
+    ax.axhline(B_PATH_MAX,  color="black",   ls="--", lw=0.8, alpha=0.6,
+               label=f"B_PATH_MAX ({B_PATH_MAX})")
+    ax.axhline(B_floor_isl, color=C_ISL,     ls=":",  lw=0.8, alpha=0.6,
+               label=f"B_floor ISL ({B_floor_isl:.3f})")
+    ax.axhline(B_floor_gnd, color=C_GND,     ls=":",  lw=0.8, alpha=0.6,
+               label=f"B_floor GND ({B_floor_gnd:.3f})")
+    ax.set_ylabel(r"$B_i$  (1/ms)")
+    ax.set_title("Service-rate estimate per path")
+    ax.legend(fontsize=8, ncol=5, loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+    # ── 2. Q trajectories ────────────────────────────────────────────────────
+    ax = axes[1]
+    add_task_shading(ax, ho_ids, task_types)
+    ax.plot(ho_ids, Q_isl, color=C_ISL, lw=1.4, label=r"$Q_{ISL}$")
+    ax.plot(ho_ids, Q_gnd, color=C_GND, lw=1.4, label=r"$Q_{GND}$")
+    ax.set_ylabel(r"$Q_i$  (1/ms)")
+    ax.set_title("Dispatcher backlog  (paper Eq. 1)")
+    ax.legend(fontsize=9, loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+    # ── 3. Dynamic cap vs actual B (per path) ────────────────────────────────
+    ax = axes[2]
+    add_task_shading(ax, ho_ids, task_types)
+    ax.plot(ho_ids, cap_isl, color=C_ISL, ls="--", lw=1.0, alpha=0.7,
+            label=r"cap$_{ISL}$ = min{B_max, Q+γ}")
+    ax.plot(ho_ids, B_isl,   color=C_ISL, lw=1.4,
+            label=r"$B_{ISL}$ (actual)")
+    ax.plot(ho_ids, cap_gnd, color=C_GND, ls="--", lw=1.0, alpha=0.7,
+            label=r"cap$_{GND}$ = min{B_max, Q+γ}")
+    ax.plot(ho_ids, B_gnd,   color=C_GND, lw=1.4,
+            label=r"$B_{GND}$ (actual)")
+    ax.axhline(B_PATH_MAX, color="black", ls="--", lw=0.8, alpha=0.4)
+    ax.set_ylabel(r"Service rate (1/ms)")
+    ax.set_title("Dynamic projection cap vs actual B  "
+                 "(when cap line meets actual line, that bound binds)")
+    ax.legend(fontsize=8, ncol=2, loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+    # ── 4. π_ISL with chosen-path scatter ────────────────────────────────────
+    ax = axes[3]
+    add_task_shading(ax, ho_ids, task_types)
+    ax.plot(ho_ids, p_isl, color="#7B1FA2", lw=1.6, label=r"$\pi_{ISL}$")
+    ax.axhline(0.5, color="black", ls=":", lw=0.8, alpha=0.5)
+    chose_isl = np.array([p == "ISL" for p in paths])
+    if chose_isl.any():
+        ax.scatter(ho_ids[chose_isl],  np.full(chose_isl.sum(), 1.03),
+                   color=C_ISL, marker="|", s=30, label="ISL chosen")
+    if (~chose_isl).any():
+        ax.scatter(ho_ids[~chose_isl], np.full((~chose_isl).sum(), -0.03),
+                   color=C_GND, marker="|", s=30, label="GND chosen")
+    ax.set_xlabel("Handover index")
+    ax.set_ylabel(r"$\pi_{ISL}$")
+    ax.set_ylim(-0.08, 1.08)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+    ax.set_title("Path selection probability and realised choices")
+    ax.legend(fontsize=9, loc="center right")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig.savefig(LEVEL1_PNG, dpi=150, bbox_inches="tight")
+    print(f"[level1] Saved → {LEVEL1_PNG}")
     plt.close(fig)
 
 
@@ -839,6 +959,7 @@ def main() -> None:
 
     # ── Debug figure (saved separately, always) ───────────────────────────────
     save_debug_instagram(rows, ho_ids, task_types)
+    save_level1_dynamics(rows, ho_ids, task_types)
 
     if not args.no_show:
         plt.show()

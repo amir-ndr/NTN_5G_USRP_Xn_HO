@@ -122,12 +122,12 @@ ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
 # ETA_X    drives NF instance weight updates (Level-2 exploration).
 # ETA_B    drives per-instance B_mult updates (Level-2 exploitation).
 _T           = 300                        # nominal horizon = HO_HARD_CAP
-ETA_PATH     = 1.0 #1.0                       # log_w update; B hits ρ-cap in 1 step anyway
-ETA_X        = 1.0 / math.sqrt(_T)       # ≈ 0.050
-ETA_B        = 0.5  / math.sqrt(_T)      # ≈ 0.025 — was 0.02
+ETA_PATH     = 0.3                       # slower descent → Q can evolve before B saturates
+ETA_X        = 0.1 #1.0 / math.sqrt(_T)       # ≈ 0.050
+ETA_B        = 0.1 #0.5  / math.sqrt(_T)      # ≈ 0.025 — was 0.02
 
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
-PROB_FLOOR   = 0.05   # minimum probability per NF instance (exploration floor)
+PROB_FLOOR   = 0.08   # minimum probability per NF instance (exploration floor)
 B_MULT_MIN   = 0.7    # minimum B_mult (70% of hardware baseline) — was 0.5
 B_MULT_MAX   = 1.5    # maximum B_mult (150% of hardware baseline) — was 2.0
 
@@ -135,14 +135,15 @@ B_MULT_MAX   = 1.5    # maximum B_mult (150% of hardware baseline) — was 2.0
 # B_i is a SERVICE RATE (1/ms) — NOT a delay.
 # B_i · x_{·,i} = (1/ms) × ms = dimensionless, keeping grad = B/(1+B·x) finite.
 #
-# B_PATH_INIT targets ρ_initial ≈ 0.40–0.50 for both paths:
-#   ISL: xn_base=4 ms → B = 0.10  → ρ = 0.40
-#   GND: xn_base=5 ms → B = 0.10  → ρ = 0.50
-# Stronger B → stronger gradient signal grad = B/(1+Bx); ρ cap at 0.80 prevents blowup.
-B_PATH_INIT  = 0.1  #0.1 # initial B_i (1/ms) — raised from 0.06 for gradient strength
-B_PATH_MAX   = 0.15 #0.15  # hard upper bound on B_i — was 0.5 (allowed ρ up to 2.0 via projection)
-RHO_MAX_PATH = 0.80   # ρ cap enforced per-node in the projection step
-RHO_MIN_PATH = 0.10   # ρ floor to keep Bx signal non-negligible
+# Tuned so the paper-correct dynamic projection bound min{B_max, Q + γ} actually
+# binds during operation (rather than the static B_PATH_MAX). For chosen path,
+# γ = 1/τ ≈ 0.20–0.25; B_PATH_MAX = 0.20 keeps the dynamic bound dominant when Q
+# is small. RHO_MIN_PATH = 0.02 lets idle paths' B genuinely collapse, exposing
+# the load-coupling feedback the paper specifies.
+B_PATH_INIT  = 0.05   # start below initial dynamic cap so B has room to evolve
+B_PATH_MAX   = 0.20   # static ceiling; dynamic Q+γ becomes binding for active paths
+RHO_MAX_PATH = 0.80   # ρ cap enforced per-node in the projection step (unused now)
+RHO_MIN_PATH = 0.02   # permissive floor — let idle path's B drop near zero
 
 # ── Task types: UPF CPR fallback (used only if instance has no task_cpr dict) ──
 # With per-instance task_cpr, these values are superseded for UPF instances.
@@ -311,6 +312,23 @@ class AccessNode:
         self.ca             = ca           # CoV of inter-arrival time
         self.B              = B_PATH_INIT  # dispatch rate (1/ms); updated by PathScheduler
 
+        # ── Xn dispatcher queue state (paper Algorithm 1, Eq. 1 at i=1) ───────
+        # Q[t+1] = max(Q[t] + γ[t] − B[t], 0)  evolves once per HO round.
+        # Used by PathScheduler exclusively as the dynamic projection bound on B
+        # (paper Step 1b: B[t+1] ∈ [0, min{B_max, Q[t] + γ[t]}]).  NOT used in
+        # delay computation — d_i is still G/G/1 steady-state via xn_setup_ms().
+        # Units: Q and γ are in 1/ms (service-rate-equivalent), matching B.
+        # One HO arrival adds γ = 1/τ units (one mean service time of work).
+        self.Q     = 0.0
+        self.gamma = 0.0
+
+    def update_queue(self, chosen: bool) -> None:
+        """Evolve dispatcher backlog Q per paper Eq. 1.  Called by PathScheduler
+        AFTER B has been re-projected this round (paper order: project B[t+1],
+        then evolve Q[t+1]).  γ = 1/τ if this path was selected, else 0."""
+        self.gamma = (1.0 / max(self.xn_base_ms, 1e-9)) if chosen else 0.0
+        self.Q     = max(self.Q + self.gamma - self.B, 0.0)
+
     def xn_setup_ms(self) -> float:
         # Full G/G/1 Kingman formula — matches paper Eq. 3 / Algorithm 1 d_i[t].
         # ρ = B × τ where B is the PathScheduler exploitation estimate for this path.
@@ -406,44 +424,57 @@ class PathScheduler:
         isl_ms:       float, gnd_ms:    float,
         trgsat_node: "AccessNode | None" = None,
         tn_node:     "AccessNode | None" = None,
+        chosen_path: str   = "ISL",
     ) -> None:
         """
-        Full-information update every round.
-        xn_isl_ms, xn_gnd_ms: Xn G/G/1 setup delay from AccessNode.xn_setup_ms() (ms).
-        isl_ms, gnd_ms:        one-way propagation delay from orbital geometry (ms).
-        trgsat_node, tn_node:  AccessNode objects; after the exploitation step their
-                               .B attribute is set to the updated B_ISL / B_GND so
-                               that ρ = B × τ reflects the algorithm's dispatch rate.
-        B in 1/ms (service rate); x in ms (prop delay) → B·x dimensionless.
+        Full-information update every round (paper Algorithm 1, Step 1).
+        xn_isl_ms, xn_gnd_ms: Xn G/G/1 setup delay (ms) — diagnostic only, kept for
+                              backward-compatible signature.
+        isl_ms, gnd_ms:       one-way propagation delay from orbital geometry (ms).
+        trgsat_node, tn_node: AccessNode objects.  After projection, B[0]/B[1] are
+                              pushed into their .B attribute, and update_queue() is
+                              called to evolve Q for the next round.
+        chosen_path:          "ISL" or "GND" — which path was sampled this round.
+                              Determines γ_i for the projection bound on B_i.
+
+        Projection bound (paper Algorithm 1, Step 1b):
+            B_i[t+1] ∈ [0, min{B_max, Q_i[t] + γ_i[t]}]
+        Q_i[t] is the dispatcher backlog from the previous round; γ_i[t] = 1/τ_i if
+        chosen this round, else 0.  An idle path has Q→0 and γ=0, so its B collapses
+        to a numerical floor B_floor (a guard preventing grad → 0 freeze).
         """
         props = [isl_ms,    gnd_ms]      # x_{·,i}: prop delay (ms)
         xns   = [xn_isl_ms, xn_gnd_ms]  # d_i[t]:  Xn G/G/1 sojourn (ms)
+        nodes = [trgsat_node, tn_node]
 
         for idx in range(2):
             x_i = props[idx]
             Bx  = self.B[idx] * x_i      # dimensionless ✓
 
-            # ── Exploration: grad = B/(1+B·x) ────────────────────────────────
+            # ── Exploration: grad = B/(1+B·x) — UNCHANGED ────────────────────
             grad = min(self.B[idx] / (1.0 + Bx), GRAD_CAP)
             self.log_w[idx] += ETA_PATH * grad
 
-            # ── Exploitation: delay-domain multiplicative step ────────────────
-            # Paper: ∇L(B·x)^T·x = Bx/(1+Bx) — dimensionless ∈ [−1, 1).
-            # Multiply d_B (not subtract) so units stay ms throughout.
+            # ── Exploitation: delay-domain multiplicative step — UNCHANGED ───
             correction = Bx / (1.0 + Bx)                   # dimensionless ✓
             d_B    = 1.0 / max(self.B[idx], 1e-9)           # current delay estimate (ms)
             d_new  = d_B * (1.0 - ETA_PATH * correction)    # ms × scalar = ms ✓
+            B_raw  = 1.0 / max(d_new, 1e-9)
 
-            # ρ-capped projection: use the node's actual service time (xn_base_ms) so
-            # that ρ = B × xn_base_ms stays within [RHO_MIN_PATH, RHO_MAX_PATH].
-            # Falls back to B_PATH_MAX / B_PATH_INIT bounds if node is unavailable.
-            nodes_list = [trgsat_node, tn_node]
-            node_i     = nodes_list[idx]
-            tau_i      = node_i.xn_base_ms if node_i is not None else xns[idx]
-            B_cap      = RHO_MAX_PATH / max(tau_i, 1e-9)    # max B → ρ ≤ RHO_MAX_PATH
-            B_floor    = RHO_MIN_PATH / max(tau_i, 1e-9)    # min B → ρ ≥ RHO_MIN_PATH
-            B_raw      = 1.0 / max(d_new, 1e-9)
-            self.B[idx] = max(B_floor, min(B_cap, min(B_PATH_MAX, B_raw)))
+            # ── Projection: paper Eq. (Algorithm 1, Step 1b) — DYNAMIC CAP ────
+            # B_i[t+1] ∈ [0, min{B_max, Q_i[t] + γ_i[t]}].
+            # Q_i carries from previous round; γ_i = 1/τ if chosen this round, else 0.
+            # B_floor is a numerical guard so an idle path's grad does not collapse
+            # to zero (paper implicitly assumes Q + γ > 0 under any HO activity).
+            node_i      = nodes[idx]
+            tau_i       = node_i.xn_base_ms if node_i is not None else xns[idx]
+            is_chosen   = (idx == 0 and chosen_path == "ISL") or \
+                          (idx == 1 and chosen_path == "GND")
+            gamma_now   = (1.0 / max(tau_i, 1e-9)) if is_chosen else 0.0
+            Q_prev      = node_i.Q if node_i is not None else 0.0
+            B_floor     = RHO_MIN_PATH / max(tau_i, 1e-9)
+            B_dyn_cap   = max(B_floor, Q_prev + gamma_now)
+            self.B[idx] = max(0.0, min(B_PATH_MAX, B_dyn_cap, B_raw))
 
         self.log_w -= self.log_w.max()
 
@@ -453,6 +484,13 @@ class PathScheduler:
             trgsat_node.B = self.B[0]
         if tn_node is not None:
             tn_node.B = self.B[1]
+
+        # Evolve queue state for next round (paper Eq. 1).  Done AFTER B is
+        # projected so the served rate reflects this round's actual B.
+        if trgsat_node is not None:
+            trgsat_node.update_queue(chosen=(chosen_path == "ISL"))
+        if tn_node is not None:
+            tn_node.update_queue(chosen=(chosen_path == "GND"))
 
     def status(self) -> str:
         return (f"π_ISL={self.p_isl:.3f}  π_GND={self.p_gnd:.3f}  "
@@ -693,6 +731,11 @@ _CSV_HEADER = [
     "gnd_amf_B0", "gnd_amf_B1", "gnd_amf_B2",
     "gnd_smf_B0", "gnd_smf_B1", "gnd_smf_B2",
     "gnd_upf_B0", "gnd_upf_B1", "gnd_upf_B2",
+    # Level-1 dispatcher state (paper Eq. 1 / Algorithm 1 Step 1b).
+    # B is the current PathScheduler service rate (1/ms) at log time.
+    # Q is the queue at start of this round (used in this round's projection bound).
+    # γ reflects this round's chosen path (1/τ if chosen, 0 otherwise).
+    "B_isl", "B_gnd", "Q_isl", "Q_gnd", "gamma_isl", "gamma_gnd",
     "global_oracle_ms",
     "access_regret_ms", "inst_regret_ms", "global_regret_ms",
     "cum_access_regret_ms", "cum_inst_regret_ms", "cum_global_regret_ms",
@@ -809,10 +852,21 @@ class Dispatcher:
         path_p_gnd:      float = 0.5,
         access_cost_isl: float = 0.0,
         access_cost_gnd: float = 0.0,
+        trgsat_node:     "AccessNode | None" = None,
+        tn_node:         "AccessNode | None" = None,
     ) -> tuple[str, dict]:
         self.ho_id += 1
         self._configure_all(task_type)   # sets base_rho (oracle) for all instances at x_ij=1.0
         n = int(TASK_N_TASKS[task_type] * LOAD_SCALE)   # for routing-weighted reconfigure inside select_and_process
+
+        # Snapshot Level-1 queue state BEFORE sched.update() evolves Q this round.
+        # γ reflects this round's chosen path (= 1/τ for chosen, 0 for non-chosen).
+        B_isl_log   = trgsat_node.B if trgsat_node is not None else 0.0
+        B_gnd_log   = tn_node.B     if tn_node     is not None else 0.0
+        Q_isl_log   = trgsat_node.Q if trgsat_node is not None else 0.0
+        Q_gnd_log   = tn_node.Q     if tn_node     is not None else 0.0
+        gamma_isl_log = (1.0 / trgsat_node.xn_base_ms) if (trgsat_node is not None and path == "ISL") else 0.0
+        gamma_gnd_log = (1.0 / tn_node.xn_base_ms)     if (tn_node     is not None and path == "GND") else 0.0
 
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
         access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
@@ -915,6 +969,12 @@ class Dispatcher:
             "gnd_amf_B0": gnd_ab[0], "gnd_amf_B1": gnd_ab[1], "gnd_amf_B2": gnd_ab[2],
             "gnd_smf_B0": gnd_sb[0], "gnd_smf_B1": gnd_sb[1], "gnd_smf_B2": gnd_sb[2],
             "gnd_upf_B0": gnd_ub[0], "gnd_upf_B1": gnd_ub[1], "gnd_upf_B2": gnd_ub[2],
+            "B_isl":     round(B_isl_log,     5),
+            "B_gnd":     round(B_gnd_log,     5),
+            "Q_isl":     round(Q_isl_log,     5),
+            "Q_gnd":     round(Q_gnd_log,     5),
+            "gamma_isl": round(gamma_isl_log, 5),
+            "gamma_gnd": round(gamma_gnd_log, 5),
             "global_oracle_ms":     round(global_oracle_ms,    3),
             "access_regret_ms":     round(access_regret_ms,    3),
             "inst_regret_ms":       round(inst_regret_ms,      3),
@@ -1037,6 +1097,8 @@ class RandomDispatcher:
         task_type:       str   = "mixed",
         access_cost_isl: float = 0.0,
         access_cost_gnd: float = 0.0,
+        trgsat_node:     "AccessNode | None" = None,
+        tn_node:         "AccessNode | None" = None,
     ) -> tuple[str, dict]:
         self.ho_id += 1
         self._configure_all(task_type)   # sets base_rho (oracle) at x_ij=1.0
@@ -1045,6 +1107,13 @@ class RandomDispatcher:
         path        = "ISL" if np.random.random() < 0.5 else "GND"
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
         access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
+
+        B_isl_log   = trgsat_node.B if trgsat_node is not None else 0.0
+        B_gnd_log   = tn_node.B     if tn_node     is not None else 0.0
+        Q_isl_log   = trgsat_node.Q if trgsat_node is not None else 0.0
+        Q_gnd_log   = tn_node.Q     if tn_node     is not None else 0.0
+        gamma_isl_log = (1.0 / trgsat_node.xn_base_ms) if (trgsat_node is not None and path == "ISL") else 0.0
+        gamma_gnd_log = (1.0 / tn_node.xn_base_ms)     if (tn_node     is not None and path == "GND") else 0.0
 
         if path == "ISL":
             amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._random_pick(self.on_amf,  AMF_CYCLES,              n, task_type)
@@ -1120,6 +1189,12 @@ class RandomDispatcher:
             "gnd_amf_B0": 1.0, "gnd_amf_B1": 1.0, "gnd_amf_B2": 1.0,
             "gnd_smf_B0": 1.0, "gnd_smf_B1": 1.0, "gnd_smf_B2": 1.0,
             "gnd_upf_B0": 1.0, "gnd_upf_B1": 1.0, "gnd_upf_B2": 1.0,
+            "B_isl":     round(B_isl_log,     5),
+            "B_gnd":     round(B_gnd_log,     5),
+            "Q_isl":     round(Q_isl_log,     5),
+            "Q_gnd":     round(Q_gnd_log,     5),
+            "gamma_isl": round(gamma_isl_log, 5),
+            "gamma_gnd": round(gamma_gnd_log, 5),
             "global_oracle_ms":     round(global_oracle_ms,    3),
             "access_regret_ms":     round(access_regret_ms,    3),
             "inst_regret_ms":       round(inst_regret_ms,      3),
@@ -1243,6 +1318,8 @@ class GreedyDispatcher:
         task_type:       str   = "mixed",
         access_cost_isl: float = 0.0,
         access_cost_gnd: float = 0.0,
+        trgsat_node:     "AccessNode | None" = None,
+        tn_node:         "AccessNode | None" = None,
     ) -> tuple[str, dict]:
         self.ho_id += 1
         self._configure_all(task_type)
@@ -1260,6 +1337,13 @@ class GreedyDispatcher:
 
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
         access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
+
+        B_isl_log   = trgsat_node.B if trgsat_node is not None else 0.0
+        B_gnd_log   = tn_node.B     if tn_node     is not None else 0.0
+        Q_isl_log   = trgsat_node.Q if trgsat_node is not None else 0.0
+        Q_gnd_log   = tn_node.Q     if tn_node     is not None else 0.0
+        gamma_isl_log = (1.0 / trgsat_node.xn_base_ms) if (trgsat_node is not None and path == "ISL") else 0.0
+        gamma_gnd_log = (1.0 / tn_node.xn_base_ms)     if (tn_node     is not None and path == "GND") else 0.0
 
         if path == "ISL":
             amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._greedy_pick(self.on_amf)
@@ -1337,6 +1421,12 @@ class GreedyDispatcher:
             "gnd_amf_B0": 1.0, "gnd_amf_B1": 1.0, "gnd_amf_B2": 1.0,
             "gnd_smf_B0": 1.0, "gnd_smf_B1": 1.0, "gnd_smf_B2": 1.0,
             "gnd_upf_B0": 1.0, "gnd_upf_B1": 1.0, "gnd_upf_B2": 1.0,
+            "B_isl":     round(B_isl_log,     5),
+            "B_gnd":     round(B_gnd_log,     5),
+            "Q_isl":     round(Q_isl_log,     5),
+            "Q_gnd":     round(Q_gnd_log,     5),
+            "gamma_isl": round(gamma_isl_log, 5),
+            "gamma_gnd": round(gamma_gnd_log, 5),
             "global_oracle_ms":     round(global_oracle_ms,    3),
             "access_regret_ms":     round(access_regret_ms,    3),
             "inst_regret_ms":       round(inst_regret_ms,      3),
