@@ -45,6 +45,7 @@ Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
       per-round stateless queuing is appropriate at this time scale.
 
       Regret_inst[t] = core_ms[t] − oracle_compute_ms[t]  (within chosen path)
+      oracle_compute_ms = optimal equal-split across stable instances (Jensen lower bound)
 
   Total end-to-end latency:
       total_ms = access_cost_chosen + core_ms
@@ -57,10 +58,13 @@ Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
       global_oracle = min over {ISL, GND} of (access_cost + best_compute_on_path)
 
 Hardware-derived instance parametrization (G/G/1 Kingman):
-    capacity_hz = (millicores / 1000) × cpu_freq_ghz × 10⁹
-    τ_ms        = cycles_per_req / capacity_hz × 1000
-    ρ           = N_tasks × cycles_per_req / capacity_hz
-    ρ ≥ 0.95    → unstable → sojourn = 999 ms
+    capacity_hz  = (millicores / 1000) × cpu_freq_ghz × 10⁹
+    τ_ms         = cycles_per_req / capacity_hz × 1000
+    base_rho     = N_tasks × cycles_per_req / capacity_hz         (oracle: full load, x_ij=1.0)
+    effective_rho = N_tasks × x_ij × cycles_per_req / capacity_hz (actual routed load)
+    ρ            = B_mult × effective_rho
+    ρ ≥ 0.95     → unstable (at current routing fraction) → sojourn = 999 ms
+    base_rho ≥ 0.95 → physically saturated → exploit_update() skipped
 
 Outputs:
     dispatch_log.csv        all Bregman HOs
@@ -118,7 +122,7 @@ ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
 # ETA_X    drives NF instance weight updates (Level-2 exploration).
 # ETA_B    drives per-instance B_mult updates (Level-2 exploitation).
 _T           = 300                        # nominal horizon = HO_HARD_CAP
-ETA_PATH     = 1.00                       # log_w update; B hits ρ-cap in 1 step anyway
+ETA_PATH     = 1.0 #1.0                       # log_w update; B hits ρ-cap in 1 step anyway
 ETA_X        = 1.0 / math.sqrt(_T)       # ≈ 0.050
 ETA_B        = 0.5  / math.sqrt(_T)      # ≈ 0.025 — was 0.02
 
@@ -135,8 +139,8 @@ B_MULT_MAX   = 1.5    # maximum B_mult (150% of hardware baseline) — was 2.0
 #   ISL: xn_base=4 ms → B = 0.10  → ρ = 0.40
 #   GND: xn_base=5 ms → B = 0.10  → ρ = 0.50
 # Stronger B → stronger gradient signal grad = B/(1+Bx); ρ cap at 0.80 prevents blowup.
-B_PATH_INIT  = 0.10   # initial B_i (1/ms) — raised from 0.06 for gradient strength
-B_PATH_MAX   = 0.15   # hard upper bound on B_i — was 0.5 (allowed ρ up to 2.0 via projection)
+B_PATH_INIT  = 0.1  #0.1 # initial B_i (1/ms) — raised from 0.06 for gradient strength
+B_PATH_MAX   = 0.15 #0.15  # hard upper bound on B_i — was 0.5 (allowed ρ up to 2.0 via projection)
 RHO_MAX_PATH = 0.80   # ρ cap enforced per-node in the projection step
 RHO_MIN_PATH = 0.10   # ρ floor to keep Bx signal non-negligible
 
@@ -494,7 +498,8 @@ class CoreInstance:
         self.B        = 1.0  # effective service rate = B_mult * B_hw  (used in grad + cost)
         self.B_mult   = 1.0  # PERSISTENT exploitation multiplier — never reset by configure()
 
-    def configure(self, cpr: int, n_tasks: int, task_type: str = "") -> None:
+    def configure(self, cpr: int, n_tasks: int, task_type: str = "",
+                  x_ij: float = 1.0) -> None:
         # CPR priority: per-instance task dict > fixed_cpr > caller-supplied cpr
         if self.task_cpr and task_type in self.task_cpr:
             effective = self.task_cpr[task_type]
@@ -504,23 +509,19 @@ class CoreInstance:
             effective = cpr
 
         self.tau_ms   = (effective / self.capacity_hz) * 1000.0
-        base_rho      = (n_tasks * effective) / self.capacity_hz
-        self.base_rho = base_rho   # ρ at B_mult=1.0; used by oracle to avoid moving target
-        # B_mult (exploitation variable) scales the effective utilization so that
-        # instances the algorithm dispatches to more heavily see higher ρ, closing
-        # the feedback loop: high dispatch rate → high ρ → higher sojourn → gradient
-        # signal weakens → weights redistribute toward less-loaded instances.
-        self.rho = min(self.B_mult * base_rho, 0.9999)
+        self.base_rho = (n_tasks * effective) / self.capacity_hz   # oracle: full load (x_ij=1.0)
+        # Routing-weighted effective load: only the fraction x_ij of total traffic is
+        # routed here.  As the algorithm concentrates traffic, x_ij rises → ρ rises →
+        # sojourn rises → gradient weakens → weights redistribute to less-loaded instances.
+        # This is the load-balancing feedback loop the paper models (A_{j,i}[t] = x_ij·N).
+        effective_rho = (n_tasks * x_ij * effective) / self.capacity_hz
+        self.rho      = min(self.B_mult * effective_rho, 0.9999)
 
-        # B_hw is the hardware service rate (1/τ_ms), updated each round as CPR changes.
-        # B = B_mult × B_hw is the effective rate used in cost/gradient computation.
-        # B_mult is the EXPLOITATION variable — it persists across rounds and is only
-        # updated by exploit_update(). Never reset here.
         self.B_hw = 1.0 / max(self.tau_ms, 1e-9)
         self.B    = self.B_mult * self.B_hw
 
     def is_stable(self) -> bool:
-        return self.base_rho < 0.95   # physics-based: B_mult cannot fake stability
+        return self.rho < 0.95   # routing-weighted load; exploit_update guards base_rho separately
 
     def _q_mean_ms(self) -> float:
         rho = min(self.rho, 0.9999)
@@ -607,7 +608,14 @@ class LayerScheduler:
     def probabilities(self) -> list[float]:
         return (self.weights / self.weights.sum()).tolist()
 
-    def select_and_process(self) -> tuple[int, list[float], float, float, float, float]:
+    def select_and_process(self, cpr: int, n_tasks: int, task_type: str) -> tuple[int, list[float], float, float, float, float]:
+        # Reconfigure each instance with its actual routing-fraction load.
+        # x_ij = current selection probability → instance sees only that fraction of
+        # total traffic, so its ρ reflects actual load rather than worst-case full load.
+        probs = self.weights / self.weights.sum()
+        for i, inst in enumerate(self.instances):
+            inst.configure(cpr, n_tasks, task_type, x_ij=float(probs[i]))
+
         stable = [i for i, inst in enumerate(self.instances) if inst.is_stable()]
         if not stable:
             stable = [min(range(self.n), key=lambda i: self.instances[i].rho)]
@@ -758,19 +766,37 @@ class Dispatcher:
             inst.configure(upf_cpr, n, task_type)
 
     def _best_compute_ms(self, path: str, task_type: str) -> float:
-        """Fixed oracle: best stable AMF+SMF+UPF compute at hardware baseline (B_mult=1.0).
-        Using base_rho for stability and delay ensures the oracle does not move as the
-        algorithm's B_mult values evolve — regret is measured against a fixed benchmark.
+        """Optimal-split oracle: expected compute cost at the optimal equal routing split.
+
+        Equal split across N_stable stable instances minimises total expected latency for
+        convex G/G/1 d(ρ) (Jensen's inequality — splitting always beats concentrating).
+        Each instance carries x_opt = 1/N_stable of total traffic → ρ_opt = base_rho/N_stable,
+        reducing Kingman wait quadratically vs single-instance-at-full-load.
+
+        Regret is measured against this oracle, not the single-best-at-full-load oracle,
+        so reported regret reflects the algorithm's convergence toward the optimal split
+        rather than its convergence toward a trivially achievable single-instance benchmark.
         """
-        def best(sched: LayerScheduler) -> float:
+        def best_split(sched: LayerScheduler) -> float:
             stable = [inst for inst in sched.instances if inst.base_rho < 0.95]
-            return min(inst.hw_expected_delay_ms() for inst in stable) if stable else 999.0
+            if not stable:
+                return 999.0
+            x_opt = 1.0 / len(stable)
+            total = 0.0
+            for inst in stable:
+                rho_opt = inst.base_rho * x_opt
+                if rho_opt >= 0.95:
+                    return 999.0
+                W_q = (rho_opt / (1.0 - rho_opt)) * \
+                      ((inst.ca**2 + inst.cs**2) / 2.0) * inst.tau_ms
+                total += x_opt * (W_q + inst.tau_ms)
+            return total
         if path == "ISL":
-            return best(self.on_amf) + best(self.on_smf) + best(self.on_upf[task_type])
-        return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf[task_type])
+            return best_split(self.on_amf) + best_split(self.on_smf) + best_split(self.on_upf[task_type])
+        return best_split(self.gnd_amf) + best_split(self.gnd_smf) + best_split(self.gnd_upf[task_type])
 
     def expected_compute_ms(self, path: str, task_type: str) -> float:
-        """Fixed oracle: best stable compute on this path at hardware baseline."""
+        """Optimal-split oracle compute cost on this path."""
         return self._best_compute_ms(path, task_type)
 
     def dispatch(
@@ -785,7 +811,8 @@ class Dispatcher:
         access_cost_gnd: float = 0.0,
     ) -> tuple[str, dict]:
         self.ho_id += 1
-        self._configure_all(task_type)
+        self._configure_all(task_type)   # sets base_rho (oracle) for all instances at x_ij=1.0
+        n = int(TASK_N_TASKS[task_type] * LOAD_SCALE)   # for routing-weighted reconfigure inside select_and_process
 
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
         access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
@@ -802,13 +829,13 @@ class Dispatcher:
         gnd_up = self.gnd_upf[task_type].probabilities()
 
         if path == "ISL":
-            amf_r = self.on_amf.select_and_process()
-            smf_r = self.on_smf.select_and_process()
-            upf_r = self.on_upf[task_type].select_and_process()
+            amf_r = self.on_amf.select_and_process(AMF_CYCLES, n, task_type)
+            smf_r = self.on_smf.select_and_process(SMF_CYCLES, n, task_type)
+            upf_r = self.on_upf[task_type].select_and_process(TASK_TYPES[task_type], n, task_type)
         else:
-            amf_r = self.gnd_amf.select_and_process()
-            smf_r = self.gnd_smf.select_and_process()
-            upf_r = self.gnd_upf[task_type].select_and_process()
+            amf_r = self.gnd_amf.select_and_process(AMF_CYCLES, n, task_type)
+            smf_r = self.gnd_smf.select_and_process(SMF_CYCLES, n, task_type)
+            upf_r = self.gnd_upf[task_type].select_and_process(TASK_TYPES[task_type], n, task_type)
 
         amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = amf_r
         smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = smf_r
@@ -966,7 +993,12 @@ class RandomDispatcher:
         for inst in self.on_upf[task_type].instances + self.gnd_upf[task_type].instances:
             inst.configure(upf_cpr, n, task_type)
 
-    def _random_pick(self, sched: LayerScheduler) -> tuple[int, list[float], float, float, float, float]:
+    def _random_pick(self, sched: LayerScheduler, cpr: int, n_tasks: int, task_type: str) -> tuple[int, list[float], float, float, float, float]:
+        # Reconfigure with uniform routing fraction (1/N per instance) so that
+        # stability is evaluated at actual uniform-split load, not worst-case full load.
+        x_uniform = 1.0 / sched.n
+        for inst in sched.instances:
+            inst.configure(cpr, n_tasks, task_type, x_ij=x_uniform)
         stable = [i for i, inst in enumerate(sched.instances) if inst.is_stable()]
         if not stable:
             stable = [min(range(sched.n), key=lambda i: sched.instances[i].rho)]
@@ -980,12 +1012,23 @@ class RandomDispatcher:
         return idx, probs, w_ms, x_val, c_val, inst.rho
 
     def _best_compute_ms(self, path: str, task_type: str) -> float:
-        def best(sched: LayerScheduler) -> float:
+        def best_split(sched: LayerScheduler) -> float:
             stable = [inst for inst in sched.instances if inst.base_rho < 0.95]
-            return min(inst.hw_expected_delay_ms() for inst in stable) if stable else 999.0
+            if not stable:
+                return 999.0
+            x_opt = 1.0 / len(stable)
+            total = 0.0
+            for inst in stable:
+                rho_opt = inst.base_rho * x_opt
+                if rho_opt >= 0.95:
+                    return 999.0
+                W_q = (rho_opt / (1.0 - rho_opt)) * \
+                      ((inst.ca**2 + inst.cs**2) / 2.0) * inst.tau_ms
+                total += x_opt * (W_q + inst.tau_ms)
+            return total
         if path == "ISL":
-            return best(self.on_amf) + best(self.on_smf) + best(self.on_upf[task_type])
-        return best(self.gnd_amf) + best(self.gnd_smf) + best(self.gnd_upf[task_type])
+            return best_split(self.on_amf) + best_split(self.on_smf) + best_split(self.on_upf[task_type])
+        return best_split(self.gnd_amf) + best_split(self.gnd_smf) + best_split(self.gnd_upf[task_type])
 
     def dispatch(
         self,
@@ -996,23 +1039,24 @@ class RandomDispatcher:
         access_cost_gnd: float = 0.0,
     ) -> tuple[str, dict]:
         self.ho_id += 1
-        self._configure_all(task_type)
+        self._configure_all(task_type)   # sets base_rho (oracle) at x_ij=1.0
+        n = int(TASK_N_TASKS[task_type] * LOAD_SCALE)
 
         path        = "ISL" if np.random.random() < 0.5 else "GND"
         prop_ms     = isl_ms if path == "ISL" else gnd_ms
         access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
 
         if path == "ISL":
-            amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._random_pick(self.on_amf)
-            smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._random_pick(self.on_smf)
-            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.on_upf[task_type])
+            amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._random_pick(self.on_amf,  AMF_CYCLES,              n, task_type)
+            smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._random_pick(self.on_smf,  SMF_CYCLES,              n, task_type)
+            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.on_upf[task_type], TASK_TYPES[task_type], n, task_type)
             on_amf_p  = amf_p;  gnd_amf_p = [1/3]*3
             on_smf_p  = smf_p;  gnd_smf_p = [1/3]*3
             on_upf_p  = upf_p;  gnd_upf_p = [1/3]*3
         else:
-            amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._random_pick(self.gnd_amf)
-            smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._random_pick(self.gnd_smf)
-            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.gnd_upf[task_type])
+            amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._random_pick(self.gnd_amf, AMF_CYCLES,              n, task_type)
+            smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._random_pick(self.gnd_smf, SMF_CYCLES,              n, task_type)
+            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._random_pick(self.gnd_upf[task_type], TASK_TYPES[task_type], n, task_type)
             on_amf_p  = [1/3]*3; gnd_amf_p = amf_p
             on_smf_p  = [1/3]*3; gnd_smf_p = smf_p
             on_upf_p  = [1/3]*3; gnd_upf_p = upf_p
@@ -1096,4 +1140,221 @@ class RandomDispatcher:
     def close(self) -> None:
         self._fh.close()
         print(f"[RandomDispatcher] Closed.  HOs={self.ho_id}  "
+              f"global_regret={self.cum_global_regret:.1f} ms")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GreedyDispatcher — perfect-info single-instance oracle baseline
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GreedyDispatcher:
+    """
+    Greedy full-information oracle:
+      - Configures all instances with current task's load.
+      - Per layer per path, picks the stable instance with minimum expected sojourn
+        E[W] = W_q + τ (Kingman steady state at single-instance full load).
+      - Picks the path with the lower (access_cost + best_AMF + best_SMF + best_UPF).
+      - Samples the realised delay from chosen instances for actual cost.
+
+    Represents the strongest single-instance policy achievable with perfect
+    knowledge of ρ.  Any learning algorithm's per-round cost should converge to
+    this; the gap is the cost of not knowing ρ a priori.
+
+    Same schema as Dispatcher / RandomDispatcher for direct comparison.
+    """
+
+    def __init__(self, log_dir: str | Path = ".", tag: str = ""):
+        self.on_amf  = LayerScheduler([CoreInstance(*p) for p in _ON_AMF_SPECS])
+        self.on_smf  = LayerScheduler([CoreInstance(*p) for p in _ON_SMF_SPECS])
+        self.on_upf  = {tt: LayerScheduler([CoreInstance(*p) for p in _ON_UPF_SPECS])
+                        for tt in TASK_TYPES}
+        self.gnd_amf = LayerScheduler([CoreInstance(*p) for p in _GND_AMF_SPECS])
+        self.gnd_smf = LayerScheduler([CoreInstance(*p) for p in _GND_SMF_SPECS])
+        self.gnd_upf = {tt: LayerScheduler([CoreInstance(*p) for p in _GND_UPF_SPECS])
+                        for tt in TASK_TYPES}
+
+        self.ho_id             = 0
+        self.cum_access_regret = 0.0
+        self.cum_inst_regret   = 0.0
+        self.cum_global_regret = 0.0
+
+        suffix   = f"_{tag}" if tag else ""
+        log_dir  = Path(log_dir)
+        fname    = f"greedy_log{suffix}.csv"
+        self._fh = open(log_dir / fname, "w", newline="")
+        self._wr = csv.DictWriter(self._fh, fieldnames=_CSV_HEADER, extrasaction="ignore")
+        self._wr.writeheader()
+        print(f"[GreedyDispatcher] Perfect-info greedy oracle  → {log_dir}/{fname}")
+
+    def _configure_all(self, task_type: str) -> None:
+        n       = int(TASK_N_TASKS[task_type] * LOAD_SCALE)
+        upf_cpr = TASK_TYPES[task_type]
+        for inst in self.on_amf.instances + self.gnd_amf.instances:
+            inst.configure(AMF_CYCLES, n, task_type)
+        for inst in self.on_smf.instances + self.gnd_smf.instances:
+            inst.configure(SMF_CYCLES, n, task_type)
+        for inst in self.on_upf[task_type].instances + self.gnd_upf[task_type].instances:
+            inst.configure(upf_cpr, n, task_type)
+
+    @staticmethod
+    def _best_expected(sched: LayerScheduler) -> tuple[int, float]:
+        """Return (idx, expected_delay_ms) for the lowest-E[W] stable instance,
+        or (idx_least_loaded, 999) if none are stable."""
+        stable = [i for i, inst in enumerate(sched.instances) if inst.is_stable()]
+        if not stable:
+            idx = min(range(sched.n), key=lambda i: sched.instances[i].rho)
+            return idx, 999.0
+        idx = min(stable, key=lambda i: sched.instances[i].expected_delay_ms())
+        return idx, sched.instances[idx].expected_delay_ms()
+
+    def _greedy_pick(self, sched: LayerScheduler):
+        idx, _ = self._best_expected(sched)
+        inst   = sched.instances[idx]
+        w_ms   = inst.sample_delay_ms()
+        x_val  = inst.x_signal(w_ms)
+        c_val  = inst.cost(x_val)
+        probs  = [1.0 if i == idx else 0.0 for i in range(sched.n)]
+        return idx, probs, w_ms, x_val, c_val, inst.rho
+
+    def _best_compute_ms(self, path: str, task_type: str) -> float:
+        # Optimal-split oracle for regret accounting (same as Dispatcher).
+        def best_split(sched: LayerScheduler) -> float:
+            stable = [inst for inst in sched.instances if inst.base_rho < 0.95]
+            if not stable:
+                return 999.0
+            x_opt = 1.0 / len(stable)
+            total = 0.0
+            for inst in stable:
+                rho_opt = inst.base_rho * x_opt
+                if rho_opt >= 0.95:
+                    return 999.0
+                W_q = (rho_opt / (1.0 - rho_opt)) * \
+                      ((inst.ca**2 + inst.cs**2) / 2.0) * inst.tau_ms
+                total += x_opt * (W_q + inst.tau_ms)
+            return total
+        if path == "ISL":
+            return best_split(self.on_amf) + best_split(self.on_smf) + best_split(self.on_upf[task_type])
+        return best_split(self.gnd_amf) + best_split(self.gnd_smf) + best_split(self.gnd_upf[task_type])
+
+    def dispatch(
+        self,
+        isl_ms:          float,
+        gnd_ms:          float,
+        task_type:       str   = "mixed",
+        access_cost_isl: float = 0.0,
+        access_cost_gnd: float = 0.0,
+    ) -> tuple[str, dict]:
+        self.ho_id += 1
+        self._configure_all(task_type)
+
+        # Greedy path choice: min(access + sum of best per-layer expected delays)
+        _, exp_amf_isl = self._best_expected(self.on_amf)
+        _, exp_smf_isl = self._best_expected(self.on_smf)
+        _, exp_upf_isl = self._best_expected(self.on_upf[task_type])
+        _, exp_amf_gnd = self._best_expected(self.gnd_amf)
+        _, exp_smf_gnd = self._best_expected(self.gnd_smf)
+        _, exp_upf_gnd = self._best_expected(self.gnd_upf[task_type])
+        total_isl = access_cost_isl + exp_amf_isl + exp_smf_isl + exp_upf_isl
+        total_gnd = access_cost_gnd + exp_amf_gnd + exp_smf_gnd + exp_upf_gnd
+        path = "ISL" if total_isl <= total_gnd else "GND"
+
+        prop_ms     = isl_ms if path == "ISL" else gnd_ms
+        access_cost = access_cost_isl if path == "ISL" else access_cost_gnd
+
+        if path == "ISL":
+            amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._greedy_pick(self.on_amf)
+            smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._greedy_pick(self.on_smf)
+            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._greedy_pick(self.on_upf[task_type])
+            on_amf_p  = amf_p;  gnd_amf_p = [0.0]*3
+            on_smf_p  = smf_p;  gnd_smf_p = [0.0]*3
+            on_upf_p  = upf_p;  gnd_upf_p = [0.0]*3
+        else:
+            amf_idx, amf_p, amf_ms, amf_x, amf_cost, amf_rho = self._greedy_pick(self.gnd_amf)
+            smf_idx, smf_p, smf_ms, smf_x, smf_cost, smf_rho = self._greedy_pick(self.gnd_smf)
+            upf_idx, upf_p, upf_ms, upf_x, upf_cost, upf_rho = self._greedy_pick(self.gnd_upf[task_type])
+            on_amf_p  = [0.0]*3; gnd_amf_p = amf_p
+            on_smf_p  = [0.0]*3; gnd_smf_p = smf_p
+            on_upf_p  = [0.0]*3; gnd_upf_p = upf_p
+
+        core_ms  = amf_ms + smf_ms + upf_ms
+        total_ms = access_cost + core_ms
+
+        inst_oracle_ms   = self._best_compute_ms(path, task_type)
+        inst_regret_ms   = max(0.0, core_ms - inst_oracle_ms)
+        access_oracle_ms = min(access_cost_isl, access_cost_gnd)
+        access_regret_ms = max(0.0, access_cost - access_oracle_ms)
+        global_oracle_ms = min(
+            access_cost_isl + self._best_compute_ms("ISL", task_type),
+            access_cost_gnd + self._best_compute_ms("GND", task_type),
+        )
+        global_regret_ms = max(0.0, total_ms - global_oracle_ms)
+
+        self.cum_access_regret += access_regret_ms
+        self.cum_inst_regret   += inst_regret_ms
+        self.cum_global_regret += global_regret_ms
+
+        ic_p_isl, ic_p_gnd = _inverse_cost_split(access_cost_isl, access_cost_gnd)
+        gp_isl = 1.0 if path == "ISL" else 0.0
+        gp_gnd = 1.0 - gp_isl
+
+        row = {
+            "ho_id":           self.ho_id,
+            "timestamp":       datetime.now(tz=timezone.utc).isoformat(),
+            "task_type":       task_type,
+            "path":            path,
+            "isl_ms":          round(isl_ms,  3),
+            "gnd_ms":          round(gnd_ms,  3),
+            "prop_ms":         round(prop_ms, 3),
+            "path_p_isl":      gp_isl,
+            "path_p_gnd":      gp_gnd,
+            "access_cost_isl": round(access_cost_isl, 3),
+            "access_cost_gnd": round(access_cost_gnd, 3),
+            "inv_cost_p_isl":  round(ic_p_isl, 4),
+            "inv_cost_p_gnd":  round(ic_p_gnd, 4),
+            "amf_inst": amf_idx,
+            "amf_p0": amf_p[0], "amf_p1": amf_p[1], "amf_p2": amf_p[2],
+            "amf_ms": round(amf_ms,3), "amf_rho": round(amf_rho,4),
+            "amf_x": round(amf_x,5), "amf_cost": round(amf_cost,5),
+            "smf_inst": smf_idx,
+            "smf_p0": smf_p[0], "smf_p1": smf_p[1], "smf_p2": smf_p[2],
+            "smf_ms": round(smf_ms,3), "smf_rho": round(smf_rho,4),
+            "smf_x": round(smf_x,5), "smf_cost": round(smf_cost,5),
+            "upf_inst": upf_idx,
+            "upf_p0": upf_p[0], "upf_p1": upf_p[1], "upf_p2": upf_p[2],
+            "upf_ms": round(upf_ms,3), "upf_rho": round(upf_rho,4),
+            "upf_x": round(upf_x,5), "upf_cost": round(upf_cost,5),
+            "core_ms":  round(core_ms,  3),
+            "total_ms": round(total_ms, 3),
+            "on_amf_p0":  on_amf_p[0],  "on_amf_p1":  on_amf_p[1],  "on_amf_p2":  on_amf_p[2],
+            "on_smf_p0":  on_smf_p[0],  "on_smf_p1":  on_smf_p[1],  "on_smf_p2":  on_smf_p[2],
+            "on_upf_p0":  on_upf_p[0],  "on_upf_p1":  on_upf_p[1],  "on_upf_p2":  on_upf_p[2],
+            "gnd_amf_p0": gnd_amf_p[0], "gnd_amf_p1": gnd_amf_p[1], "gnd_amf_p2": gnd_amf_p[2],
+            "gnd_smf_p0": gnd_smf_p[0], "gnd_smf_p1": gnd_smf_p[1], "gnd_smf_p2": gnd_smf_p[2],
+            "gnd_upf_p0": gnd_upf_p[0], "gnd_upf_p1": gnd_upf_p[1], "gnd_upf_p2": gnd_upf_p[2],
+            "on_amf_B0":  1.0, "on_amf_B1":  1.0, "on_amf_B2":  1.0,
+            "on_smf_B0":  1.0, "on_smf_B1":  1.0, "on_smf_B2":  1.0,
+            "on_upf_B0":  1.0, "on_upf_B1":  1.0, "on_upf_B2":  1.0,
+            "gnd_amf_B0": 1.0, "gnd_amf_B1": 1.0, "gnd_amf_B2": 1.0,
+            "gnd_smf_B0": 1.0, "gnd_smf_B1": 1.0, "gnd_smf_B2": 1.0,
+            "gnd_upf_B0": 1.0, "gnd_upf_B1": 1.0, "gnd_upf_B2": 1.0,
+            "global_oracle_ms":     round(global_oracle_ms,    3),
+            "access_regret_ms":     round(access_regret_ms,    3),
+            "inst_regret_ms":       round(inst_regret_ms,      3),
+            "global_regret_ms":     round(global_regret_ms,    3),
+            "cum_access_regret_ms": round(self.cum_access_regret, 3),
+            "cum_inst_regret_ms":   round(self.cum_inst_regret,   3),
+            "cum_global_regret_ms": round(self.cum_global_regret, 3),
+        }
+
+        self._wr.writerow(row)
+        self._fh.flush()
+        return path, row
+
+    def status(self) -> str:
+        return (f"[GreedyDispatcher] ho_id={self.ho_id}  "
+                f"cum_global_regret={self.cum_global_regret:.1f} ms")
+
+    def close(self) -> None:
+        self._fh.close()
+        print(f"[GreedyDispatcher] Closed.  HOs={self.ho_id}  "
               f"global_regret={self.cum_global_regret:.1f} ms")

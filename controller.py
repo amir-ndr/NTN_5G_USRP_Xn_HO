@@ -55,7 +55,7 @@ from pathlib import Path
 from skyfield.api import load, wgs84
 from orbit import OrbitalEngine
 from dispatcher import (
-    Dispatcher, RandomDispatcher,
+    Dispatcher, RandomDispatcher, GreedyDispatcher,
     AccessNode, PathScheduler,
     TASK_CYCLE,
 )
@@ -409,6 +409,7 @@ def _trigger_handover(
     task_type:        str,
     path_scheduler:   "PathScheduler",
     rand_dispatcher:  "RandomDispatcher | None" = None,
+    greedy_dispatcher: "GreedyDispatcher | None" = None,
 ) -> bool:
     """
     Execute an Xn handover via two-level Bregman learning:
@@ -466,6 +467,16 @@ def _trigger_handover(
     # ── Random baseline: 50/50 path + uniform NF (independent of Bregman) ────
     if rand_dispatcher is not None:
         rand_dispatcher.dispatch(
+            isl_ms          = isl_ms,
+            gnd_ms          = gnd_ms,
+            task_type       = task_type,
+            access_cost_isl = cost_isl,
+            access_cost_gnd = cost_gnd,
+        )
+
+    # ── Greedy oracle: perfect-info single-instance choice (upper bound on learning) ──
+    if greedy_dispatcher is not None:
+        greedy_dispatcher.dispatch(
             isl_ms          = isl_ms,
             gnd_ms          = gnd_ms,
             task_type       = task_type,
@@ -636,8 +647,9 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Controller] Output directory: {run_dir}/")
 
-    dispatcher      = Dispatcher(log_dir=run_dir, tag=run_tag)
-    rand_dispatcher = RandomDispatcher(log_dir=run_dir, tag=run_tag)
+    dispatcher        = Dispatcher(log_dir=run_dir, tag=run_tag)
+    rand_dispatcher   = RandomDispatcher(log_dir=run_dir, tag=run_tag)
+    greedy_dispatcher = GreedyDispatcher(log_dir=run_dir, tag=run_tag)
     # Single shared PathScheduler — all task types contribute to the same π_ISL / π_GND
     # (175 total HOs feed one scheduler vs 35/scheduler with per-task dict)
     path_scheduler = PathScheduler()
@@ -689,6 +701,7 @@ def main():
         print("\n[Controller] Stopping.")
         dispatcher.close()
         rand_dispatcher.close()
+        greedy_dispatcher.close()
     signal.signal(signal.SIGINT, _stop)
 
     sim_label = (f"  time scale: {scale:.1f}×  (~HO every {5400/scale:.0f}s real)"
@@ -786,7 +799,7 @@ def main():
 
             _trigger_handover(state, engine, sim_time, HO_ELEVATION_THRESHOLD_DEG,
                               dispatcher, trgsat_node, tn_node, task_type,
-                              path_scheduler, rand_dispatcher)
+                              path_scheduler, rand_dispatcher, greedy_dispatcher)
 
             # ── Hard cap: stop after HO_HARD_CAP dispatches (cap is inclusive) ─
             if ho_count >= HO_HARD_CAP:
@@ -798,6 +811,7 @@ def main():
                 running = False
                 dispatcher.close()
                 rand_dispatcher.close()
+                greedy_dispatcher.close()
                 break
 
             # Recompute state with the new pair for accurate display
