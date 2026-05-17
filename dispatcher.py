@@ -9,14 +9,14 @@ Two-level Bregman mirror descent hierarchy (Algorithm 1, paper §III-B):
   Level 1 — PathScheduler (access layer, lives in controller.py):
       Single shared scheduler across all task types — accumulates all 175 HO updates
       into one π_ISL / π_GND estimate (vs. ~35 updates per scheduler with per-task dict).
-      Gradient signal: x_i = prop_delay_i  (ms, propagation cost of path i)
-      Cost function:   L(x) = log(1 + B_i · x)  with B_i = 1/xn_setup_i (inverse Xn delay)
-      Update rule (inverse-cost oracle via Bregman mirror descent):
-        B_i[t] ← 1 / xn_setup_i  (set directly, no gradient update needed)
-        log_w[i] += η_path · min(B_i/(1 + B_i·x_i), GRAD_CAP)
-      With this choice, the exploration gradient becomes:
-        B_i/(1+B_i·x_i) = (1/d_xn)/(1 + x_prop/d_xn) = 1/(d_xn + x_prop) = 1/access_cost
-      So π converges to inverse-cost optimal split automatically.
+      Gradient signal: x_i = prop_delay_i + xn_setup_i  (TOTAL access cost in ms)
+      Update rule (relative-advantage Bregman mirror descent):
+        relative_advantage_i = (mean_cost - x_i) / mean_cost
+        log_w[i] += η_path · clip(relative_advantage_i, ±GRAD_CAP)
+      Positive when path i is CHEAPER than average → π_i grows.
+      Negative when path i is MORE EXPENSIVE → π_i shrinks.
+      This direct cost-based gradient gives strong, responsive learning signal,
+      unlike the original log(1+B·x) which was too compressive for large B*x.
       After each HO, B[0]/B[1] are pushed into trgsat_node.B/tn_node.B so that
       AccessNode.xn_setup_ms() reflects the algorithm's actual dispatch rate (closed loop).
 
@@ -125,8 +125,8 @@ ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
 # ETA_B    drives per-instance B_mult updates (Level-2 exploitation).
 _T           = 300                        # nominal horizon = HO_HARD_CAP
 ETA_PATH     = 0.5                       # 2x increase for faster path preference (was 0.3)
-ETA_X        = 0.1 #1.0 / math.sqrt(_T)       # ≈ 0.050
-ETA_B        = 0.01 #0.5  / math.sqrt(_T)     # reduced from 0.1 for Fix 1a
+ETA_X        = 0.2                           # 2x faster Level-2 exploration (was 0.1)
+ETA_B        = 0.05                          # 5x faster Level-2 exploitation (was 0.01)
 
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
 PROB_FLOOR   = 0.03   # reduced to allow faster path convergence (was 0.08)
@@ -443,43 +443,46 @@ class PathScheduler:
         chosen this round, else 0.  An idle path has Q→0 and γ=0, so its B collapses
         to a numerical floor B_floor (a guard preventing grad → 0 freeze).
         """
-        props = [isl_ms,    gnd_ms]      # x_{·,i}: prop delay (ms)
-        xns   = [xn_isl_ms, xn_gnd_ms]  # d_i[t]:  Xn G/G/1 sojourn (ms)
+        props = [isl_ms,    gnd_ms]      # propagation delay (ms)
+        xns   = [xn_isl_ms, xn_gnd_ms]   # Xn G/G/1 sojourn (ms)
         nodes = [trgsat_node, tn_node]
 
-        for idx in range(2):
-            x_i = props[idx]
-            node_i = nodes[idx]
-            xn_base_ms = node_i.xn_base_ms if node_i is not None else 4.0  # trgSAT≈4ms, TN≈5ms
+        # ── CRITICAL FIX: Use TOTAL access cost, not just propagation ─────────────────
+        # Old bug: x_i = props[idx] (0.5-3ms only) → B*x tiny → gradient nearly
+        # constant for both paths → algorithm BLIND to cost differences.
+        # Fix: total_cost = prop + xn_setup (~25-30ms) → meaningful gradient signal.
+        total_cost = [props[0] + xns[0], props[1] + xns[1]]
+        mean_cost  = (total_cost[0] + total_cost[1]) / 2.0
 
-            # ── Set B to target utilization ρ ≈ 0.45 (faster exploration gradient) ────────
-            # B = TARGET_RHO / xn_base_ms makes ρ = B × xn_base ≈ 0.45 (stronger learning signal)
-            # Increased from 0.35 to speed up path preference convergence.
-            # With this B, the exploration gradient becomes:
-            #   grad = B/(1+B·x) ∝ 1/(xn_base + x_prop) ≈ 1/access_cost
+        for idx in range(2):
+            x_i = total_cost[idx]               # TOTAL access cost (was: props[idx])
+            node_i = nodes[idx]
+            xn_base_ms = node_i.xn_base_ms if node_i is not None else 4.0
+
+            # ── Set B to target utilization ρ ≈ 0.45 ──────────────────────────────────────
             TARGET_RHO = 0.45
             B_target = TARGET_RHO / max(xn_base_ms, 1e-9)
 
-            # ── Exploitation: small gradient step to adapt B over time ────────────────────
-            # Restore the learning arm: B adapts slowly based on observed delay
-            # ∂L/∂B = x/(1+B·x); safe step size ETA_B_PATH avoids oscillation
+            # ── Exploitation: gradient step on B (uses total cost now) ────────────────────
             Bx_current = self.B[idx] * x_i
-            grad_B = x_i / (1.0 + Bx_current)  # ∂L/∂B, dimensionless
-            grad_B = min(grad_B, 0.5)  # Reduced cap enables differentiation between delay magnitudes
-            ETA_B_PATH = 0.001   # Conservative: prevents B collapse on large delays
+            grad_B = x_i / (1.0 + Bx_current)
+            grad_B = min(grad_B, 0.5)
+            ETA_B_PATH = 0.001
             B_updated = self.B[idx] - ETA_B_PATH * grad_B
 
-            # Blend: favor gradient-learned B with strong regularization to target
+            # Blend: favor gradient-learned B with light regularization to target
             self.B[idx] = 0.8 * B_updated + 0.2 * B_target
 
-            # ── Exploration: grad = B/(1+B·x) — inverse-cost weighting ──────────
-            Bx   = self.B[idx] * x_i      # dimensionless ✓
-            grad = min(self.B[idx] / (1.0 + Bx), GRAD_CAP)
+            # ── Exploration: DIRECT relative-advantage gradient (FIX 2) ───────────────────
+            # Old bug: grad = B/(1+B·x) is compressive — squashes differences when B*x large.
+            # Fix: use relative advantage = (mean - x_i)/mean. Range: [-1, +1].
+            # Positive when path i is CHEAPER than average → log_w grows → π_i rises.
+            # This gives much stronger, more responsive learning signal.
+            relative_advantage = (mean_cost - x_i) / max(mean_cost, 1e-3)
+            grad = max(min(relative_advantage, GRAD_CAP), -GRAD_CAP)
             self.log_w[idx] += ETA_PATH * grad
 
             # ── Projection: clip B to valid range ────────────────────────────────
-            # B_floor = RHO_MIN_PATH/xn_base ensures accessible queue space.
-            # B_PATH_MAX must exceed γ_max = 1/τ_min so Q can stabilize.
             B_floor = RHO_MIN_PATH / max(xn_base_ms, 1e-9)
             self.B[idx] = max(B_floor, min(B_PATH_MAX, self.B[idx]))
 
