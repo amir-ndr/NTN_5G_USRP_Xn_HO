@@ -124,12 +124,12 @@ ALPHA        = 0.1    # cost-signal scaling for Level-2:  x = α(w − τ_max)
 # ETA_X    drives NF instance weight updates (Level-2 exploration).
 # ETA_B    drives per-instance B_mult updates (Level-2 exploitation).
 _T           = 300                        # nominal horizon = HO_HARD_CAP
-ETA_PATH     = 0.3                       # 6x increase to enable π_ISL oscillation in 30-100 HOs (was 0.05)
+ETA_PATH     = 0.5                       # 2x increase for faster path preference (was 0.3)
 ETA_X        = 0.1 #1.0 / math.sqrt(_T)       # ≈ 0.050
 ETA_B        = 0.01 #0.5  / math.sqrt(_T)     # reduced from 0.1 for Fix 1a
 
 GRAD_CAP     = 5.0    # gradient cap for both levels (prevents log-weight overflow)
-PROB_FLOOR   = 0.08   # minimum probability per NF instance (exploration floor)
+PROB_FLOOR   = 0.03   # reduced to allow faster path convergence (was 0.08)
 B_MULT_MIN   = 0.7    # minimum B_mult (70% of hardware baseline) — was 0.5
 B_MULT_MAX   = 1.5    # maximum B_mult (150% of hardware baseline) — was 2.0
 
@@ -452,12 +452,12 @@ class PathScheduler:
             node_i = nodes[idx]
             xn_base_ms = node_i.xn_base_ms if node_i is not None else 4.0  # trgSAT≈4ms, TN≈5ms
 
-            # ── Set B to target utilization ρ ≈ 0.35 (realistic Xn operating point) ────────
-            # B = TARGET_RHO / xn_base_ms makes ρ = B × xn_base ≈ 0.35 (avoids Kingman blowup)
-            # This gives xn_setup ≈ 6-7 ms (realistic), not 30+ ms from ρ=0.85 cap.
+            # ── Set B to target utilization ρ ≈ 0.45 (faster exploration gradient) ────────
+            # B = TARGET_RHO / xn_base_ms makes ρ = B × xn_base ≈ 0.45 (stronger learning signal)
+            # Increased from 0.35 to speed up path preference convergence.
             # With this B, the exploration gradient becomes:
             #   grad = B/(1+B·x) ∝ 1/(xn_base + x_prop) ≈ 1/access_cost
-            TARGET_RHO = 0.35
+            TARGET_RHO = 0.45
             B_target = TARGET_RHO / max(xn_base_ms, 1e-9)
 
             # ── Exploitation: small gradient step to adapt B over time ────────────────────
