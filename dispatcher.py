@@ -425,6 +425,8 @@ class PathScheduler:
         trgsat_node: "AccessNode | None" = None,
         tn_node:     "AccessNode | None" = None,
         chosen_path: str   = "ISL",
+        compute_isl: float = 0.0,
+        compute_gnd: float = 0.0,
     ) -> None:
         """
         Full-information update every round (paper Algorithm 1, Step 1).
@@ -447,11 +449,15 @@ class PathScheduler:
         xns   = [xn_isl_ms, xn_gnd_ms]   # Xn G/G/1 sojourn (ms)
         nodes = [trgsat_node, tn_node]
 
-        # ── CRITICAL FIX: Use TOTAL access cost, not just propagation ─────────────────
-        # Old bug: x_i = props[idx] (0.5-3ms only) → B*x tiny → gradient nearly
-        # constant for both paths → algorithm BLIND to cost differences.
-        # Fix: total_cost = prop + xn_setup (~25-30ms) → meaningful gradient signal.
-        total_cost = [props[0] + xns[0], props[1] + xns[1]]
+        # ── Fix B: Use TOTAL end-to-end cost (access + compute) ───────────────────────
+        # Level-1 must see compute pressure too — otherwise it can't react when
+        # instance instability at instagram/heavy load makes one path's compute
+        # much more expensive than the other (e.g. only 1 stable ON-UPF vs 3 GND-UPFs).
+        # Old: total_cost = prop + xn (access only) — blind to compute imbalance
+        # New: total_cost = prop + xn + compute_oracle — enables compute-aware switching
+        computes   = [compute_isl, compute_gnd]
+        total_cost = [props[0] + xns[0] + computes[0],
+                      props[1] + xns[1] + computes[1]]
         mean_cost  = (total_cost[0] + total_cost[1]) / 2.0
 
         for idx in range(2):

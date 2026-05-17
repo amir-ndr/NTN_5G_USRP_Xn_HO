@@ -92,7 +92,7 @@ HO_ELEVATION_THRESHOLD_DEG = 25.0
 # Algorithm convergence saturates around HO 150–200, so 280 captures the full
 # learning curve with margin and stops cleanly before bad geometry contaminates
 # downstream plots / USRP latency.
-HO_HARD_CAP = 400
+HO_HARD_CAP = 300
 
 # After HO fires, wait for srcSat to rise above this before re-arming
 # (only relevant in real-time mode; accelerated mode uses a timer reset).
@@ -462,10 +462,13 @@ def _trigger_handover(
     )
 
     # Paper Algorithm 1 — Level-1 PathScheduler update (full-information).
-    # x_{·,i} = propagation delay (paper definition); Xn sojourn used for exploitation B.
-    # chosen_path drives γ_i for the dynamic projection bound on B_i (Step 1b).
+    # Fix B: pass per-path expected compute cost so Level-1 sees compute pressure
+    # (e.g. instagram at heavy load → ON-UPF concentration → high ISL compute).
+    compute_isl = dispatcher.expected_compute_ms("ISL", task_type)
+    compute_gnd = dispatcher.expected_compute_ms("GND", task_type)
     sched.update(trgsat_node.xn_setup_ms(), tn_node.xn_setup_ms(), isl_ms, gnd_ms,
-                 trgsat_node, tn_node, chosen_path=path)
+                 trgsat_node, tn_node, chosen_path=path,
+                 compute_isl=compute_isl, compute_gnd=compute_gnd)
 
     # ── Random baseline: 50/50 path + uniform NF (independent of Bregman) ────
     if rand_dispatcher is not None:
@@ -675,10 +678,15 @@ def main():
     #               cs=0.6, ca=0.7: near-deterministic ground processing — variance
     #               multiplier (c_a²+c_s²)/2 ≈ 0.425 keeps d_i bounded vs TrgSAT's
     #               ≈ 1.325.
-    trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=4.0,
-                             xn_capacity_hz=2e9, cs=1.2, ca=1.1)
-    tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=5.0,
-                             xn_capacity_hz=8e9, cs=0.6, ca=0.7)
+    # ── Fix A: Realistic Xn hardware reflecting real onboard vs ground core ──────
+    # Onboard satellite Xn: SLOW power-limited processor, bursty service variance
+    # Ground core Xn: FAST datacenter-class, deterministic service
+    # This creates genuine compute disadvantage for NTN, enabling load/task driven
+    # path switching that was masked by previous near-identical Xn baselines.
+    trgsat_node = AccessNode(name="TrgSAT", ngap_ms=1.0, xn_base_ms=7.0,
+                             xn_capacity_hz=1.5e9, cs=1.4, ca=1.3)
+    tn_node     = AccessNode(name="TN",     ngap_ms=0.5, xn_base_ms=3.5,
+                             xn_capacity_hz=8e9, cs=0.5, ca=0.6)
 
     ho_count          = 0              # total HOs fired
     task_rotation_idx = 0              # current position in TASK_ROTATION
