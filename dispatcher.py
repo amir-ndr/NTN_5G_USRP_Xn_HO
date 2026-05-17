@@ -465,7 +465,7 @@ class PathScheduler:
             # ∂L/∂B = x/(1+B·x); safe step size ETA_B_PATH avoids oscillation
             Bx_current = self.B[idx] * x_i
             grad_B = x_i / (1.0 + Bx_current)  # ∂L/∂B, dimensionless
-            grad_B = min(grad_B, 2.0)  # Cap gradient to prevent collapse on large delays
+            grad_B = min(grad_B, 0.5)  # Reduced cap enables differentiation between delay magnitudes
             ETA_B_PATH = 0.001   # Conservative: prevents B collapse on large delays
             B_updated = self.B[idx] - ETA_B_PATH * grad_B
 
